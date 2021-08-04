@@ -693,7 +693,7 @@ pub(crate) mod mock_sink {
 	//! 2. All messages expected by the probe must be received by the time of dropping it. Unreceived
 	//!    messages will lead to a panic while dropping a probe.
 
-	use super::{MessageId, ParaId, UmpSink, UpwardMessage};
+	use super::{upward_message_id, MessageId, ParaId, UmpSink, UpwardMessage};
 	use frame_support::weights::Weight;
 	use std::{cell::RefCell, collections::vec_deque::VecDeque};
 
@@ -701,12 +701,18 @@ pub(crate) mod mock_sink {
 	struct UmpExpectation {
 		expected_origin: ParaId,
 		expected_msg: UpwardMessage,
-		mock_weight: Weight,
+		// the result returned from the `process_upward_message` for this expected message.
+		mock_result: Result<Weight, (MessageId, Weight)>,
 	}
 
 	std::thread_local! {
 		// `Some` here indicates that there is an active probe.
 		static HOOK: RefCell<Option<VecDeque<UmpExpectation>>> = RefCell::new(None);
+	}
+
+	/// Yeet an expectation into the active probe instance. Panics if there is no active probe.
+	fn push_expectation(expectation: UmpExpectation) {
+		HOOK.with(|opt_hook| opt_hook.borrow_mut().as_mut().unwrap().push_back(expectation));
 	}
 
 	pub struct MockUmpSink;
@@ -716,28 +722,35 @@ pub(crate) mod mock_sink {
 			actual_msg: &[u8],
 			_max_weight: Weight,
 		) -> Result<Weight, (MessageId, Weight)> {
-			Ok(HOOK
-				.with(|opt_hook| {
-					opt_hook.borrow_mut().as_mut().map(|hook| {
-						let UmpExpectation { expected_origin, expected_msg, mock_weight } =
-							match hook.pop_front() {
-								Some(expectation) => expectation,
-								None => {
-									panic!(
-							"The probe is active but didn't expect the message:\n\n\t{:?}.",
-							actual_msg,
-						);
-								},
-							};
-						assert_eq!(expected_origin, actual_origin);
-						assert_eq!(expected_msg, &actual_msg[..]);
-						mock_weight
-					})
+			HOOK.with(|opt_hook| {
+				opt_hook.borrow_mut().as_mut().map(|hook| {
+					let UmpExpectation { expected_origin, expected_msg, mock_result } =
+						match hook.pop_front() {
+							Some(expectation) => expectation,
+							None => {
+								panic!(
+									"The probe is active but didn't expect the message:\n\n\t{:?}.",
+									actual_msg,
+								);
+							},
+						};
+					assert_eq!(expected_origin, actual_origin);
+					assert_eq!(expected_msg, &actual_msg[..]);
+					mock_result
 				})
-				.unwrap_or(0))
+			})
+			.unwrap_or(Ok(0))
 		}
 	}
 
+	/// A probe that can intercept messages funneled into the `MockUmpSink` and make it return the
+	/// desired results.
+	///
+	/// Only one instance of a probe can exist at a time within a thread. In case the second instance
+	/// is created on the same thread the constructor will trigger a panic.
+	///
+	/// The expected messages are enqueued via [`assert_msg`] or [`assert_overweight_msg`] methods.
+	/// The enqueued messages are processed in FIFO order.
 	pub struct Probe {
 		_private: (),
 	}
@@ -757,20 +770,30 @@ pub(crate) mod mock_sink {
 		}
 
 		/// Add an expected message.
-		///
-		/// The enqueued messages are processed in FIFO order.
 		pub fn assert_msg(
 			&mut self,
 			expected_origin: ParaId,
 			expected_msg: UpwardMessage,
 			mock_weight: Weight,
 		) {
-			HOOK.with(|opt_hook| {
-				opt_hook.borrow_mut().as_mut().unwrap().push_back(UmpExpectation {
-					expected_origin,
-					expected_msg,
-					mock_weight,
-				})
+			push_expectation(UmpExpectation {
+				expected_origin,
+				expected_msg,
+				mock_result: Ok(mock_weight),
+			});
+		}
+
+		/// Add an expected message which is overweight.
+		pub fn assert_overweight_msg(
+			&mut self,
+			expected_origin: ParaId,
+			expected_msg: UpwardMessage,
+			mock_weight_required: Weight,
+		) {
+			push_expectation(UmpExpectation {
+				mock_result: Err((upward_message_id(&expected_msg[..]), mock_weight_required)),
+				expected_origin,
+				expected_msg,
 			});
 		}
 	}
@@ -806,7 +829,11 @@ pub(crate) mod mock_sink {
 #[cfg(test)]
 mod tests {
 	use super::{mock_sink::Probe, *};
-	use crate::mock::{new_test_ext, Configuration, MockGenesisConfig, Ump};
+	use crate::mock::{
+		assert_last_event, new_test_ext, Configuration, MockGenesisConfig, Origin, System, Test,
+		Ump,
+	};
+	use frame_support::{assert_noop, assert_ok};
 	use std::collections::HashSet;
 
 	struct GenesisConfigBuilder {
@@ -815,6 +842,7 @@ mod tests {
 		max_upward_queue_count: u32,
 		max_upward_queue_size: u32,
 		ump_service_total_weight: Weight,
+		ump_max_individual_weight: Weight,
 	}
 
 	impl Default for GenesisConfigBuilder {
@@ -825,6 +853,7 @@ mod tests {
 				max_upward_queue_count: 4,
 				max_upward_queue_size: 64,
 				ump_service_total_weight: 1000,
+				ump_max_individual_weight: 100,
 			}
 		}
 	}
@@ -839,6 +868,7 @@ mod tests {
 			config.max_upward_queue_count = self.max_upward_queue_count;
 			config.max_upward_queue_size = self.max_upward_queue_size;
 			config.ump_service_total_weight = self.ump_service_total_weight;
+			config.ump_max_individual_weight = self.ump_max_individual_weight;
 			genesis
 		}
 	}
@@ -1064,6 +1094,87 @@ mod tests {
 
 			assert_eq!(cnt, 1);
 			assert_eq!(size, 3);
+		});
+	}
+
+	#[test]
+	fn service_overweight_unknown() {
+		// This test just makes sure that 0 is not a valid index and we can use it not worrying in
+		// the next test.
+		new_test_ext(GenesisConfigBuilder::default().build()).execute_with(|| {
+			assert_noop!(Ump::service_overweight(Origin::root(), 0, 1000), Error::<Test>::Unknown);
+		});
+	}
+
+	#[test]
+	fn overweight_queue_works() {
+		let para_a = ParaId::from(2021);
+
+		let a_msg_1 = vec![1, 2, 3];
+		let a_msg_2 = vec![3, 2, 1];
+		let a_msg_3 = vec![9, 8, 7];
+
+		new_test_ext(
+			GenesisConfigBuilder {
+				ump_service_total_weight: 900,
+				ump_max_individual_weight: 300,
+				..Default::default()
+			}
+			.build(),
+		)
+		.execute_with(|| {
+			// HACK: Start with the block number 1. This is needed because should an event be
+			// emitted during the genesis block they will be implicitly wiped.
+			System::set_block_number(1);
+
+			{
+				// This one is overweight. However, the weight is plenty and we can afford to execute
+				// this message, thus expect it.
+
+				let mut probe = Probe::new();
+
+				queue_upward_msg(para_a, a_msg_1.clone());
+				probe.assert_msg(para_a, a_msg_1.clone(), 301);
+				Ump::process_pending_upward_messages();
+
+				drop(probe);
+			}
+
+			{
+				// This is overweight and this message cannot fit into the total weight budget.
+
+				queue_upward_msg(para_a, a_msg_2.clone());
+				queue_upward_msg(para_a, a_msg_3.clone());
+
+				let mut probe = Probe::new();
+
+				probe.assert_msg(para_a, a_msg_2.clone(), 500);
+				probe.assert_overweight_msg(para_a, a_msg_3.clone(), 500);
+				Ump::process_pending_upward_messages();
+				assert_last_event(
+					Event::OverweightEnqueued(para_a, upward_message_id(&a_msg_3[..]), 0, 500)
+						.into(),
+				);
+				drop(probe);
+			}
+
+			{
+				let mut probe = Probe::new();
+				probe.assert_overweight_msg(para_a, a_msg_3.clone(), 1001);
+				assert_noop!(
+					Ump::service_overweight(Origin::root(), 0, 1000),
+					Error::<Test>::OverLimit
+				);
+				drop(probe);
+			}
+
+			{
+				let mut probe = Probe::new();
+				probe.assert_msg(para_a, a_msg_3.clone(), 1000);
+				assert_ok!(Ump::service_overweight(Origin::root(), 0, 1000));
+				assert_last_event(Event::OverweightServiced(0, 1000).into());
+				drop(probe);
+			}
 		});
 	}
 }
