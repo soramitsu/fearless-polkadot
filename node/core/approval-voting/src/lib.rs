@@ -527,6 +527,14 @@ impl CurrentlyCheckingSet {
 		if let Err(k) = val.binary_search_by_key(&relay_block, |v| *v) {
 			let _ = val.insert(k, relay_block);
 			let work = launch_work.await?;
+			tracing::debug!(
+				target: LOG_TARGET,
+				block_hash = ?relay_block,
+				?candidate_hash,
+				?validator_index,
+				"Launching Approval Checking task. Total Number of current ongoing tasks: {:?}",
+				self.currently_checking.len(),
+			);
 			self.currently_checking.push(Box::pin(async move {
 				match work.timeout(APPROVAL_CHECKING_TIMEOUT).await {
 					None => ApprovalState {
@@ -537,6 +545,8 @@ impl CurrentlyCheckingSet {
 					Some(approval_state) => approval_state,
 				}
 			}));
+		} else {
+			tracing::debug!(target: LOG_TARGET, ?candidate_hash, "[BUG] Cache disparity.",);
 		}
 
 		Ok(())
@@ -863,8 +873,24 @@ async fn handle_actions(
 					candidate_index,
 				));
 
+				tracing::debug!(
+					target: LOG_TARGET,
+					?relay_block_hash,
+					?candidate_hash,
+					assignment_tranche,
+					session,
+					?backing_group,
+					"New Approval launched.",
+				);
+
 				match approvals_cache.get(&candidate_hash) {
 					Some(ApprovalOutcome::Approved) => {
+						tracing::debug!(
+							target: LOG_TARGET,
+							?candidate_hash,
+							"Cached approval reached.",
+						);
+
 						let new_actions: Vec<Action> = std::iter::once(Action::IssueApproval(
 							candidate_hash,
 							ApprovalVoteRequest { validator_index, block_hash },
@@ -875,6 +901,12 @@ async fn handle_actions(
 						actions_iter = new_actions.into_iter();
 					},
 					None => {
+						tracing::debug!(
+							target: LOG_TARGET,
+							?candidate_hash,
+							"New CandidateHash found.",
+						);
+
 						let ctx = &mut *ctx;
 						currently_checking_set
 							.insert_relay_block_hash(
@@ -2109,6 +2141,17 @@ async fn launch_approval(
 	let candidate_hash = candidate.hash();
 	let para_id = candidate.descriptor.para_id;
 
+	tracing::debug!(
+		target: LOG_TARGET,
+		?block_hash,
+		?candidate_hash,
+		?session_index,
+		?validator_index,
+		?backing_group,
+		?para_id,
+		"Approval Launched.",
+	);
+
 	tracing::trace!(target: LOG_TARGET, ?candidate_hash, ?para_id, "Recovering data.");
 
 	let timer = metrics.time_recover_and_approve();
@@ -2143,7 +2186,7 @@ async fn launch_approval(
 			Ok(Err(e)) => {
 				match &e {
 					&RecoveryError::Unavailable => {
-						tracing::warn!(
+						tracing::debug!(
 							target: LOG_TARGET,
 							?para_id,
 							?candidate_hash,
@@ -2154,7 +2197,7 @@ async fn launch_approval(
 						metrics_guard.take().on_approval_unavailable();
 					},
 					&RecoveryError::Invalid => {
-						tracing::warn!(
+						tracing::debug!(
 							target: LOG_TARGET,
 							?para_id,
 							?candidate_hash,
@@ -2181,12 +2224,42 @@ async fn launch_approval(
 		};
 
 		let validation_code = match code_rx.await {
-			Err(_) => return ApprovalState::failed(validator_index, candidate_hash),
-			Ok(Err(_)) => return ApprovalState::failed(validator_index, candidate_hash),
-			Ok(Ok(Some(code))) => code,
-			Ok(Ok(None)) => {
-				tracing::warn!(
+			Err(e) => {
+				tracing::error!(
 					target: LOG_TARGET,
+					err = ?e,
+					?candidate_hash,
+					?para_id,
+					"Validation code unavailable due to internal error on code_rx receive",
+				);
+				return ApprovalState::failed(validator_index, candidate_hash)
+			},
+			Ok(Err(e)) => {
+				tracing::error!(
+					target: LOG_TARGET,
+					err = ?e,
+					?candidate_hash,
+					?para_id,
+					"Validation code unavailable due to internal error of received value",
+				);
+				return ApprovalState::failed(validator_index, candidate_hash)
+			},
+			Ok(Ok(Some(code))) => {
+				tracing::debug!(
+					target: LOG_TARGET,
+					?para_id,
+					?candidate_hash,
+					"Validation code available for block {:?} in the state of block {:?} (a recent descendant)",
+					candidate.descriptor.relay_parent,
+					block_hash,
+				);
+				code
+			},
+			Ok(Ok(None)) => {
+				tracing::debug!(
+					target: LOG_TARGET,
+					?para_id,
+					?candidate_hash,
 					"Validation code unavailable for block {:?} in the state of block {:?} (a recent descendant)",
 					candidate.descriptor.relay_parent,
 					block_hash,
@@ -2215,7 +2288,16 @@ async fn launch_approval(
 			.await;
 
 		match val_rx.await {
-			Err(_) => return ApprovalState::failed(validator_index, candidate_hash),
+			Err(e) => {
+				tracing::error!(
+					target: LOG_TARGET,
+					err = ?e,
+					?candidate_hash,
+					?para_id,
+					"Failed to validate candidate due to internal error on val_rx receive",
+				);
+				return ApprovalState::failed(validator_index, candidate_hash)
+			},
 			Ok(Ok(ValidationResult::Valid(commitments, _))) => {
 				// Validation checked out. Issue an approval command. If the underlying service is unreachable,
 				// then there isn't anything we can do.
@@ -2225,8 +2307,20 @@ async fn launch_approval(
 				let expected_commitments_hash = candidate.commitments_hash;
 				if commitments.hash() == expected_commitments_hash {
 					let _ = metrics_guard.take();
+					tracing::debug!(
+						target: LOG_TARGET,
+						?para_id,
+						?candidate_hash,
+						"Commitments Hash matches expected",
+					);
 					return ApprovalState::approved(validator_index, candidate_hash)
 				} else {
+					tracing::debug!(
+						target: LOG_TARGET,
+						?para_id,
+						?candidate_hash,
+						"Detected Commitments Hash mismatch, issuing dispute",
+					);
 					// Commitments mismatch - issue a dispute.
 					sender
 						.send_message(
@@ -2245,7 +2339,7 @@ async fn launch_approval(
 				}
 			},
 			Ok(Ok(ValidationResult::Invalid(reason))) => {
-				tracing::warn!(
+				tracing::debug!(
 					target: LOG_TARGET,
 					?reason,
 					?candidate_hash,
