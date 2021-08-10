@@ -17,7 +17,10 @@
 //! Prometheus metrics related to the overseer and its channels.
 
 use super::*;
-use polkadot_node_metrics::metrics::{self, prometheus};
+use polkadot_node_metrics::{
+	memory_stats::MemoryAllocationSnapshot,
+	metrics::{self, prometheus}
+};
 
 /// Overseer Prometheus metrics.
 #[derive(Clone)]
@@ -31,6 +34,9 @@ struct MetricsInner {
 	to_subsystem_unbounded_received: prometheus::GaugeVec<prometheus::U64>,
 	signals_sent: prometheus::GaugeVec<prometheus::U64>,
 	signals_received: prometheus::GaugeVec<prometheus::U64>,
+
+	memory_stats_resident: prometheus::Gauge<prometheus::U64>,
+	memory_stats_allocated: prometheus::Gauge<prometheus::U64>,
 }
 
 /// A shareable metrics type for usage with the overseer.
@@ -53,6 +59,21 @@ impl Metrics {
 	pub(crate) fn on_message_relayed(&self) {
 		if let Some(metrics) = &self.0 {
 			metrics.messages_relayed_total.inc();
+		}
+	}
+
+	pub(crate) fn memory_stats_snapshot(
+		&self,
+		memory_stats: MemoryAllocationSnapshot,
+	) {
+		if let Some(metrics) = &self.0 {
+			let MemoryAllocationSnapshot {
+				resident,
+				allocated,
+			} = memory_stats;
+
+			metrics.memory_stats_allocated.set(allocated);
+			metrics.memory_stats_resident.set(resident);
 		}
 	}
 
@@ -182,6 +203,21 @@ impl metrics::Metrics for Metrics {
 				)?,
 				registry,
 			)?,
+			memory_stats_allocated: prometheus::register(
+				prometheus::Gauge::<prometheus::U64>::new(
+					"parachain_overseer_memory_stats_allocated",
+					"Total bytes allocated by the node",
+				)?,
+				registry,
+			)?,
+			memory_stats_resident: prometheus::register(
+				prometheus::Gauge::<prometheus::U64>::new(
+					"parachain_overseer_memory_stats_resident",
+					"Bytes allocated by the node, and held in RAM",
+				)?,
+				registry,
+			)?,
+
 		};
 		Ok(Metrics(Some(metrics)))
 	}
