@@ -19,7 +19,7 @@
 use super::*;
 use polkadot_node_metrics::{
 	memory_stats::MemoryAllocationSnapshot,
-	metrics::{self, prometheus}
+	metrics::{self, prometheus},
 };
 
 /// Overseer Prometheus metrics.
@@ -62,15 +62,9 @@ impl Metrics {
 		}
 	}
 
-	pub(crate) fn memory_stats_snapshot(
-		&self,
-		memory_stats: MemoryAllocationSnapshot,
-	) {
+	pub(crate) fn memory_stats_snapshot(&self, memory_stats: MemoryAllocationSnapshot) {
 		if let Some(metrics) = &self.0 {
-			let MemoryAllocationSnapshot {
-				resident,
-				allocated,
-			} = memory_stats;
+			let MemoryAllocationSnapshot { resident, allocated } = memory_stats;
 
 			metrics.memory_stats_allocated.set(allocated);
 			metrics.memory_stats_resident.set(resident);
@@ -217,7 +211,6 @@ impl metrics::Metrics for Metrics {
 				)?,
 				registry,
 			)?,
-
 		};
 		Ok(Metrics(Some(metrics)))
 	}
