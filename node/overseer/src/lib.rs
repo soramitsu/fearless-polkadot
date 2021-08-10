@@ -701,8 +701,12 @@ where
 			let metronome =
 				Metronome::new(std::time::Duration::from_millis(950)).for_each(move |_| {
 					match memory_stats.snapshot() {
-						Ok(memory_stats_snapshot) => metronome_metrics.memory_stats_snapshot(memory_stats_snapshot),
-						Err(e) => tracing::debug!("Failed to obtain memory stats: {:?}", e),
+						Ok(memory_stats_snapshot) => {
+							tracing::trace!(target: LOG_TARGET, "memory_stats: {:?}", &memory_stats_snapshot);
+							metronome_metrics.memory_stats_snapshot(memory_stats_snapshot);
+						}
+
+						Err(e) => tracing::debug!(target: LOG_TARGET, "Failed to obtain memory stats: {:?}", e),
 					}
 
 					// We combine the amount of messages from subsystems to the overseer

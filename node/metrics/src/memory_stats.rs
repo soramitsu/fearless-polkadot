@@ -27,41 +27,37 @@ use jemalloc_ctl::{epoch, stats, Result};
 /// Accessor to the allocator internals.
 #[derive(Clone)]
 pub struct MemoryAllocationTracker {
-    epoch: jemalloc_ctl::epoch_mib,
-    allocated: stats::allocated_mib,
-    resident: stats::resident_mib,
+	epoch: jemalloc_ctl::epoch_mib,
+	allocated: stats::allocated_mib,
+	resident: stats::resident_mib,
 }
 
 impl MemoryAllocationTracker {
-    /// Create an instance of an allocation tracker.
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            epoch: epoch::mib()?,
-            allocated: stats::allocated::mib()?,
-            resident: stats::resident::mib()?,
-        })
-    }
+	/// Create an instance of an allocation tracker.
+	pub fn new() -> Result<Self> {
+		Ok(Self {
+			epoch: epoch::mib()?,
+			allocated: stats::allocated::mib()?,
+			resident: stats::resident::mib()?,
+		})
+	}
 
-    /// Create an allocation snapshot.
-    pub fn snapshot(&self) -> Result<MemoryAllocationSnapshot> {
-        // update stats by advancing the allocation epoch
-        self.epoch.advance()?;
+	/// Create an allocation snapshot.
+	pub fn snapshot(&self) -> Result<MemoryAllocationSnapshot> {
+		// update stats by advancing the allocation epoch
+		self.epoch.advance()?;
 
-        let allocated: u64 = self.allocated.read()? as _;
-        let resident: u64 = self.resident.read()? as _;
-        Ok(MemoryAllocationSnapshot {
-            allocated,
-            resident,
-        })
-    }
+		let allocated: u64 = self.allocated.read()? as _;
+		let resident: u64 = self.resident.read()? as _;
+		Ok(MemoryAllocationSnapshot { allocated, resident })
+	}
 }
-
 
 /// Snapshot of collected memory metrics.
 #[derive(Debug, Clone)]
 pub struct MemoryAllocationSnapshot {
-    /// Total resident memory, in bytes.
-    pub resident: u64,
-    /// Total allocated memory, in bytes.
-    pub allocated: u64,
+	/// Total resident memory, in bytes.
+	pub resident: u64,
+	/// Total allocated memory, in bytes.
+	pub allocated: u64,
 }
