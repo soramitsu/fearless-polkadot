@@ -1,1 +1,6 @@
-bridges/ @tomusdrw @svyatonik @hcastano
+bridges/ @tomusdrw @svyatonik @acatangiu
+
+# CI
+/.github/ @paritytech/ci @chevdor
+/scripts/ci/ @paritytech/ci @chevdor
+/.gitlab-ci.yml @paritytech/ci

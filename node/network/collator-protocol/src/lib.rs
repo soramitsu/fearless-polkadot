@@ -17,7 +17,8 @@
 //! The Collator Protocol allows collators and validators talk to each other.
 //! This subsystem implements both sides of the collator protocol.
 
-#![deny(missing_docs, unused_crate_dependencies)]
+#![deny(missing_docs)]
+#![deny(unused_crate_dependencies)]
 #![recursion_limit = "256"]
 
 use std::time::Duration;
@@ -26,8 +27,11 @@ use futures::{FutureExt, TryFutureExt};
 
 use sp_keystore::SyncCryptoStorePtr;
 
-use polkadot_node_network_protocol::{PeerId, UnifiedReputationChange as Rep};
-use polkadot_primitives::v1::CollatorPair;
+use polkadot_node_network_protocol::{
+	request_response::{v1 as request_v1, IncomingRequestReceiver},
+	PeerId, UnifiedReputationChange as Rep,
+};
+use polkadot_primitives::v2::CollatorPair;
 
 use polkadot_subsystem::{
 	errors::SubsystemError,
@@ -36,7 +40,6 @@ use polkadot_subsystem::{
 };
 
 mod error;
-use error::Result;
 
 mod collator_side;
 mod validator_side;
@@ -73,7 +76,12 @@ pub enum ProtocolSide {
 		metrics: validator_side::Metrics,
 	},
 	/// Collators operate on a parachain.
-	Collator(PeerId, CollatorPair, collator_side::Metrics),
+	Collator(
+		PeerId,
+		CollatorPair,
+		IncomingRequestReceiver<request_v1::CollationFetchingRequest>,
+		collator_side::Metrics,
+	),
 }
 
 /// The collator protocol subsystem.
@@ -90,7 +98,7 @@ impl CollatorProtocolSubsystem {
 		Self { protocol_side }
 	}
 
-	async fn run<Context>(self, ctx: Context) -> Result<()>
+	async fn run<Context>(self, ctx: Context) -> std::result::Result<(), error::FatalError>
 	where
 		Context: overseer::SubsystemContext<Message = CollatorProtocolMessage>,
 		Context: SubsystemContext<Message = CollatorProtocolMessage>,
@@ -98,8 +106,8 @@ impl CollatorProtocolSubsystem {
 		match self.protocol_side {
 			ProtocolSide::Validator { keystore, eviction_policy, metrics } =>
 				validator_side::run(ctx, keystore, eviction_policy, metrics).await,
-			ProtocolSide::Collator(local_peer_id, collator_pair, metrics) =>
-				collator_side::run(ctx, local_peer_id, collator_pair, metrics).await,
+			ProtocolSide::Collator(local_peer_id, collator_pair, req_receiver, metrics) =>
+				collator_side::run(ctx, local_peer_id, collator_pair, req_receiver, metrics).await,
 		}
 	}
 }
@@ -125,7 +133,7 @@ async fn modify_reputation<Context>(ctx: &mut Context, peer: PeerId, rep: Rep)
 where
 	Context: SubsystemContext,
 {
-	tracing::trace!(
+	gum::trace!(
 		target: LOG_TARGET,
 		rep = ?rep,
 		peer_id = %peer,

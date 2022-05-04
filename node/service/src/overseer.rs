@@ -15,14 +15,26 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use super::{AuthorityDiscoveryApi, Block, Error, Hash, IsCollator, Registry, SpawnNamed};
-use polkadot_network_bridge::RequestMultiplexer;
+use lru::LruCache;
+use polkadot_availability_distribution::IncomingRequestReceivers;
 use polkadot_node_core_approval_voting::Config as ApprovalVotingConfig;
 use polkadot_node_core_av_store::Config as AvailabilityConfig;
 use polkadot_node_core_candidate_validation::Config as CandidateValidationConfig;
 use polkadot_node_core_chain_selection::Config as ChainSelectionConfig;
 use polkadot_node_core_dispute_coordinator::Config as DisputeCoordinatorConfig;
-use polkadot_overseer::{AllSubsystems, BlockInfo, Overseer, OverseerHandle};
-use polkadot_primitives::v1::ParachainHost;
+use polkadot_node_core_provisioner::ProvisionerConfig;
+use polkadot_node_network_protocol::request_response::{v1 as request_v1, IncomingRequestReceiver};
+#[cfg(any(feature = "malus", test))]
+pub use polkadot_overseer::{
+	dummy::{dummy_overseer_builder, DummySubsystem},
+	HeadSupportsParachains,
+};
+use polkadot_overseer::{
+	metrics::Metrics as OverseerMetrics, BlockInfo, InitializedOverseerBuilder, MetricsTrait,
+	Overseer, OverseerConnector, OverseerHandle,
+};
+
+use polkadot_primitives::runtime_api::ParachainHost;
 use sc_authority_discovery::Service as AuthorityDiscoveryService;
 use sc_client_api::AuxStore;
 use sc_keystore::LocalKeystore;
@@ -48,10 +60,11 @@ pub use polkadot_node_core_candidate_validation::CandidateValidationSubsystem;
 pub use polkadot_node_core_chain_api::ChainApiSubsystem;
 pub use polkadot_node_core_chain_selection::ChainSelectionSubsystem;
 pub use polkadot_node_core_dispute_coordinator::DisputeCoordinatorSubsystem;
-pub use polkadot_node_core_dispute_participation::DisputeParticipationSubsystem;
-pub use polkadot_node_core_provisioner::ProvisioningSubsystem as ProvisionerSubsystem;
+pub use polkadot_node_core_provisioner::ProvisionerSubsystem;
+pub use polkadot_node_core_pvf_checker::PvfCheckerSubsystem;
 pub use polkadot_node_core_runtime_api::RuntimeApiSubsystem;
-pub use polkadot_statement_distribution::StatementDistribution as StatementDistributionSubsystem;
+use polkadot_node_subsystem_util::rand::{self, SeedableRng};
+pub use polkadot_statement_distribution::StatementDistributionSubsystem;
 
 /// Arguments passed for overseer construction.
 pub struct OverseerGenArgs<'a, Spawner, RuntimeClient>
@@ -67,13 +80,19 @@ where
 	/// Runtime client generic, providing the `ProvieRuntimeApi` trait besides others.
 	pub runtime_client: Arc<RuntimeClient>,
 	/// The underlying key value store for the parachains.
-	pub parachains_db: Arc<dyn kvdb::KeyValueDB>,
+	pub parachains_db: Arc<dyn polkadot_node_subsystem_util::database::Database>,
 	/// Underlying network service implementation.
 	pub network_service: Arc<sc_network::NetworkService<Block, Hash>>,
 	/// Underlying authority discovery service.
 	pub authority_discovery_service: AuthorityDiscoveryService,
-	/// A multiplexer to arbitrate incoming `IncomingRequest`s from the network.
-	pub request_multiplexer: RequestMultiplexer,
+	/// POV request receiver
+	pub pov_req_receiver: IncomingRequestReceiver<request_v1::PoVFetchingRequest>,
+	pub chunk_req_receiver: IncomingRequestReceiver<request_v1::ChunkFetchingRequest>,
+	pub collation_req_receiver: IncomingRequestReceiver<request_v1::CollationFetchingRequest>,
+	pub available_data_req_receiver:
+		IncomingRequestReceiver<request_v1::AvailableDataFetchingRequest>,
+	pub statement_req_receiver: IncomingRequestReceiver<request_v1::StatementFetchingRequest>,
+	pub dispute_req_receiver: IncomingRequestReceiver<request_v1::DisputeRequest>,
 	/// Prometheus registry, commonly used for production systems, less so for test.
 	pub registry: Option<&'a Registry>,
 	/// Task spawner to be used throughout the overseer and the APIs it provides.
@@ -90,20 +109,26 @@ where
 	pub chain_selection_config: ChainSelectionConfig,
 	/// Configuration for the dispute coordinator subsystem.
 	pub dispute_coordinator_config: DisputeCoordinatorConfig,
+	/// Enable PVF pre-checking
+	pub pvf_checker_enabled: bool,
 }
 
-/// Create a default, unaltered set of subsystems.
-///
-/// A convenience for usage with malus, to avoid
-/// repetitive code across multiple behavior strain implementations.
-pub fn create_default_subsystems<'a, Spawner, RuntimeClient>(
+/// Obtain a prepared `OverseerBuilder`, that is initialized
+/// with all default values.
+pub fn prepared_overseer_builder<'a, Spawner, RuntimeClient>(
 	OverseerGenArgs {
+		leaves,
 		keystore,
 		runtime_client,
 		parachains_db,
 		network_service,
 		authority_discovery_service,
-		request_multiplexer,
+		pov_req_receiver,
+		chunk_req_receiver,
+		collation_req_receiver,
+		available_data_req_receiver,
+		statement_req_receiver,
+		dispute_req_receiver,
 		registry,
 		spawner,
 		is_collator,
@@ -112,13 +137,16 @@ pub fn create_default_subsystems<'a, Spawner, RuntimeClient>(
 		candidate_validation_config,
 		chain_selection_config,
 		dispute_coordinator_config,
-		..
+		pvf_checker_enabled,
 	}: OverseerGenArgs<'a, Spawner, RuntimeClient>,
 ) -> Result<
-	AllSubsystems<
+	InitializedOverseerBuilder<
+		Spawner,
+		Arc<RuntimeClient>,
 		CandidateValidationSubsystem,
-		CandidateBackingSubsystem<Spawner>,
-		StatementDistributionSubsystem,
+		PvfCheckerSubsystem,
+		CandidateBackingSubsystem,
+		StatementDistributionSubsystem<rand::rngs::StdRng>,
 		AvailabilityDistributionSubsystem,
 		AvailabilityRecoverySubsystem,
 		BitfieldSigningSubsystem<Spawner>,
@@ -135,9 +163,8 @@ pub fn create_default_subsystems<'a, Spawner, RuntimeClient>(
 		CollatorProtocolSubsystem,
 		ApprovalDistributionSubsystem,
 		ApprovalVotingSubsystem,
-		GossipSupportSubsystem,
+		GossipSupportSubsystem<AuthorityDiscoveryService>,
 		DisputeCoordinatorSubsystem,
-		DisputeParticipationSubsystem,
 		DisputeDistributionSubsystem<AuthorityDiscoveryService>,
 		ChainSelectionSubsystem,
 	>,
@@ -150,39 +177,51 @@ where
 {
 	use polkadot_node_subsystem_util::metrics::Metrics;
 
-	let all_subsystems = AllSubsystems {
-		availability_distribution: AvailabilityDistributionSubsystem::new(
+	let metrics = <OverseerMetrics as MetricsTrait>::register(registry)?;
+
+	let builder = Overseer::builder()
+		.availability_distribution(AvailabilityDistributionSubsystem::new(
 			keystore.clone(),
+			IncomingRequestReceivers { pov_req_receiver, chunk_req_receiver },
 			Metrics::register(registry)?,
-		),
-		availability_recovery: AvailabilityRecoverySubsystem::with_chunks_only(),
-		availability_store: AvailabilityStoreSubsystem::new(
+		))
+		.availability_recovery(AvailabilityRecoverySubsystem::with_chunks_only(
+			available_data_req_receiver,
+			Metrics::register(registry)?,
+		))
+		.availability_store(AvailabilityStoreSubsystem::new(
 			parachains_db.clone(),
 			availability_config,
 			Metrics::register(registry)?,
-		),
-		bitfield_distribution: BitfieldDistributionSubsystem::new(Metrics::register(registry)?),
-		bitfield_signing: BitfieldSigningSubsystem::new(
+		))
+		.bitfield_distribution(BitfieldDistributionSubsystem::new(Metrics::register(registry)?))
+		.bitfield_signing(BitfieldSigningSubsystem::new(
 			spawner.clone(),
 			keystore.clone(),
 			Metrics::register(registry)?,
-		),
-		candidate_backing: CandidateBackingSubsystem::new(
-			spawner.clone(),
+		))
+		.candidate_backing(CandidateBackingSubsystem::new(
 			keystore.clone(),
 			Metrics::register(registry)?,
-		),
-		candidate_validation: CandidateValidationSubsystem::with_config(
+		))
+		.candidate_validation(CandidateValidationSubsystem::with_config(
 			candidate_validation_config,
+			Metrics::register(registry)?, // candidate-validation metrics
+			Metrics::register(registry)?, // validation host metrics
+		))
+		.pvf_checker(PvfCheckerSubsystem::new(
+			pvf_checker_enabled,
+			keystore.clone(),
 			Metrics::register(registry)?,
-		),
-		chain_api: ChainApiSubsystem::new(runtime_client.clone(), Metrics::register(registry)?),
-		collation_generation: CollationGenerationSubsystem::new(Metrics::register(registry)?),
-		collator_protocol: {
+		))
+		.chain_api(ChainApiSubsystem::new(runtime_client.clone(), Metrics::register(registry)?))
+		.collation_generation(CollationGenerationSubsystem::new(Metrics::register(registry)?))
+		.collator_protocol({
 			let side = match is_collator {
 				IsCollator::Yes(collator_pair) => ProtocolSide::Collator(
 					network_service.local_peer_id().clone(),
 					collator_pair,
+					collation_req_receiver,
 					Metrics::register(registry)?,
 				),
 				IsCollator::No => ProtocolSide::Validator {
@@ -192,47 +231,68 @@ where
 				},
 			};
 			CollatorProtocolSubsystem::new(side)
-		},
-		network_bridge: NetworkBridgeSubsystem::new(
+		})
+		.network_bridge(NetworkBridgeSubsystem::new(
 			network_service.clone(),
 			authority_discovery_service.clone(),
-			request_multiplexer,
 			Box::new(network_service.clone()),
 			Metrics::register(registry)?,
-		),
-		provisioner: ProvisionerSubsystem::new(spawner.clone(), (), Metrics::register(registry)?),
-		runtime_api: RuntimeApiSubsystem::new(
+		))
+		.provisioner(ProvisionerSubsystem::new(
+			spawner.clone(),
+			ProvisionerConfig,
+			Metrics::register(registry)?,
+		))
+		.runtime_api(RuntimeApiSubsystem::new(
 			runtime_client.clone(),
 			Metrics::register(registry)?,
 			spawner.clone(),
-		),
-		statement_distribution: StatementDistributionSubsystem::new(
+		))
+		.statement_distribution(StatementDistributionSubsystem::new(
 			keystore.clone(),
+			statement_req_receiver,
 			Metrics::register(registry)?,
-		),
-		approval_distribution: ApprovalDistributionSubsystem::new(Metrics::register(registry)?),
-		approval_voting: ApprovalVotingSubsystem::with_config(
+			rand::rngs::StdRng::from_entropy(),
+		))
+		.approval_distribution(ApprovalDistributionSubsystem::new(Metrics::register(registry)?))
+		.approval_voting(ApprovalVotingSubsystem::with_config(
 			approval_voting_config,
 			parachains_db.clone(),
 			keystore.clone(),
 			Box::new(network_service.clone()),
 			Metrics::register(registry)?,
-		),
-		gossip_support: GossipSupportSubsystem::new(keystore.clone()),
-		dispute_coordinator: DisputeCoordinatorSubsystem::new(
-			parachains_db.clone(),
-			dispute_coordinator_config,
-			keystore.clone(),
-		),
-		dispute_participation: DisputeParticipationSubsystem::new(),
-		dispute_distribution: DisputeDistributionSubsystem::new(
+		))
+		.gossip_support(GossipSupportSubsystem::new(
 			keystore.clone(),
 			authority_discovery_service.clone(),
 			Metrics::register(registry)?,
-		),
-		chain_selection: ChainSelectionSubsystem::new(chain_selection_config, parachains_db),
-	};
-	Ok(all_subsystems)
+		))
+		.dispute_coordinator(DisputeCoordinatorSubsystem::new(
+			parachains_db.clone(),
+			dispute_coordinator_config,
+			keystore.clone(),
+			Metrics::register(registry)?,
+		))
+		.dispute_distribution(DisputeDistributionSubsystem::new(
+			keystore.clone(),
+			dispute_req_receiver,
+			authority_discovery_service.clone(),
+			Metrics::register(registry)?,
+		))
+		.chain_selection(ChainSelectionSubsystem::new(chain_selection_config, parachains_db))
+		.leaves(Vec::from_iter(
+			leaves
+				.into_iter()
+				.map(|BlockInfo { hash, parent_hash: _, number }| (hash, number)),
+		))
+		.activation_external_listeners(Default::default())
+		.span_per_active_leaf(Default::default())
+		.active_leaves(Default::default())
+		.supports_parachains(runtime_client)
+		.known_leaves(LruCache::new(KNOWN_LEAVES_CACHE_SIZE))
+		.metrics(metrics)
+		.spawner(spawner);
+	Ok(builder)
 }
 
 /// Trait for the `fn` generating the overseer.
@@ -243,6 +303,7 @@ pub trait OverseerGen {
 	/// Overwrite the full generation of the overseer, including the subsystems.
 	fn generate<'a, Spawner, RuntimeClient>(
 		&self,
+		connector: OverseerConnector,
 		args: OverseerGenArgs<'a, Spawner, RuntimeClient>,
 	) -> Result<(Overseer<Spawner, Arc<RuntimeClient>>, OverseerHandle), Error>
 	where
@@ -251,12 +312,14 @@ pub trait OverseerGen {
 		Spawner: 'static + SpawnNamed + Clone + Unpin,
 	{
 		let gen = RealOverseerGen;
-		RealOverseerGen::generate::<Spawner, RuntimeClient>(&gen, args)
+		RealOverseerGen::generate::<Spawner, RuntimeClient>(&gen, connector, args)
 	}
 	// It would be nice to make `create_subsystems` part of this trait,
 	// but the amount of generic arguments that would be required as
 	// as consequence make this rather annoying to implement and use.
 }
+
+use polkadot_overseer::KNOWN_LEAVES_CACHE_SIZE;
 
 /// The regular set of subsystems.
 pub struct RealOverseerGen;
@@ -264,6 +327,7 @@ pub struct RealOverseerGen;
 impl OverseerGen for RealOverseerGen {
 	fn generate<'a, Spawner, RuntimeClient>(
 		&self,
+		connector: OverseerConnector,
 		args: OverseerGenArgs<'a, Spawner, RuntimeClient>,
 	) -> Result<(Overseer<Spawner, Arc<RuntimeClient>>, OverseerHandle), Error>
 	where
@@ -271,14 +335,8 @@ impl OverseerGen for RealOverseerGen {
 		RuntimeClient::Api: ParachainHost<Block> + BabeApi<Block> + AuthorityDiscoveryApi<Block>,
 		Spawner: 'static + SpawnNamed + Clone + Unpin,
 	{
-		let spawner = args.spawner.clone();
-		let leaves = args.leaves.clone();
-		let runtime_client = args.runtime_client.clone();
-		let registry = args.registry.clone();
-
-		let all_subsystems = create_default_subsystems::<Spawner, RuntimeClient>(args)?;
-
-		Overseer::new(leaves, all_subsystems, registry, runtime_client, spawner)
+		prepared_overseer_builder(args)?
+			.build_with_connector(connector)
 			.map_err(|e| e.into())
 	}
 }

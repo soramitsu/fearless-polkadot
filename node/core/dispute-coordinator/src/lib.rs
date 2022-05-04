@@ -22,80 +22,93 @@
 //!
 //! This subsystem will be the point which produce dispute votes, either positive or negative, based on locally-observed
 //! validation results as well as a sink for votes received by other subsystems. When importing a dispute vote from
-//! another node, this will trigger the dispute participation subsystem to recover and validate the block and call
-//! back to this subsystem.
+//! another node, this will trigger dispute participation to recover and validate the block.
 
-use std::{
-	collections::HashSet,
-	sync::Arc,
-	time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashSet, sync::Arc};
 
-use polkadot_node_primitives::{
-	CandidateVotes, DisputeMessage, DisputeMessageCheckError, SignedDisputeStatement,
-	DISPUTE_WINDOW,
-};
-use polkadot_node_subsystem::{
-	errors::{ChainApiError, RuntimeApiError},
-	messages::{
-		BlockDescription, ChainApiMessage, DisputeCoordinatorMessage, DisputeDistributionMessage,
-		DisputeParticipationMessage, ImportStatementsResult,
-	},
-	overseer, FromOverseer, OverseerSignal, SpawnedSubsystem, SubsystemContext, SubsystemError,
-};
-use polkadot_node_subsystem_util::rolling_session_window::{
-	RollingSessionWindow, SessionWindowUpdate,
-};
-use polkadot_primitives::v1::{
-	BlockNumber, CandidateHash, CandidateReceipt, DisputeStatement, Hash, SessionIndex,
-	SessionInfo, ValidatorIndex, ValidatorPair, ValidatorSignature,
-};
+use futures::FutureExt;
 
-use futures::{channel::oneshot, prelude::*};
-use kvdb::KeyValueDB;
-use parity_scale_codec::{Decode, Encode, Error as CodecError};
 use sc_keystore::LocalKeystore;
 
-use backend::{Backend, OverlayedBackend};
-use db::v1::{DbBackend, RecentDisputes};
+use polkadot_node_primitives::{CandidateVotes, DISPUTE_WINDOW};
+use polkadot_node_subsystem::{
+	messages::DisputeCoordinatorMessage, overseer, ActivatedLeaf, FromOverseer, OverseerSignal,
+	SpawnedSubsystem, SubsystemContext, SubsystemError,
+};
+use polkadot_node_subsystem_util::{
+	database::Database, rolling_session_window::RollingSessionWindow,
+};
+use polkadot_primitives::v2::{ScrapedOnChainVotes, ValidatorIndex, ValidatorPair};
 
-mod backend;
-mod db;
+use crate::{
+	error::{FatalResult, JfyiError, Result},
+	metrics::Metrics,
+	status::{get_active_with_status, SystemClock},
+};
+use backend::{Backend, OverlayedBackend};
+use db::v1::DbBackend;
+use fatality::Split;
+
+use self::{
+	participation::{ParticipationPriority, ParticipationRequest},
+	spam_slots::{SpamSlots, UnconfirmedDisputes},
+};
+
+pub(crate) mod backend;
+pub(crate) mod db;
+pub(crate) mod error;
+
+/// Subsystem after receiving the first active leaf.
+mod initialized;
+use initialized::Initialized;
+
+/// Provider of data scraped from chain.
+///
+/// If we have seen a candidate included somewhere, we should treat it as priority and will be able
+/// to provide an ordering for participation. Thus a dispute for a candidate where we can get some
+/// ordering is high-priority (we know it is a valid dispute) and those can be ordered by
+/// `participation` based on `relay_parent` block number and other metrics, so each validator will
+/// participate in disputes in a similar order, which ensures we will be resolving disputes, even
+/// under heavy load.
+mod scraping;
+use scraping::ChainScraper;
+
+/// When importing votes we will check via the `ordering` module, whether or not we know of the
+/// candidate to be included somewhere. If not, the votes might be spam, in this case we want to
+/// limit the amount of locally imported votes, to prevent DoS attacks/resource exhaustion. The
+/// `spam_slots` module helps keeping track of unconfirmed disputes per validators, if a spam slot
+/// gets full, we will drop any further potential spam votes from that validator and report back
+/// that the import failed. Which will lead to any honest validator to retry, thus the spam slots
+/// can be relatively small, as a drop is not fatal.
+mod spam_slots;
+
+/// Handling of participation requests via `Participation`.
+///
+/// `Participation` provides an API (`Participation::queue_participation`) for queuing of dispute participations and will process those
+/// participation requests, such that most important/urgent disputes will be resolved and processed
+/// first and more importantly it will order requests in a way so disputes will get resolved, even
+/// if there are lots of them.
+pub(crate) mod participation;
+
+/// Metrics types.
+mod metrics;
+
+/// Status tracking of disputes (`DisputeStatus`).
+mod status;
+
+use crate::status::Clock;
 
 #[cfg(test)]
 mod tests;
 
-const LOG_TARGET: &str = "parachain::dispute-coordinator";
+pub(crate) const LOG_TARGET: &str = "parachain::dispute-coordinator";
 
-// The choice here is fairly arbitrary. But any dispute that concluded more than a few minutes ago
-// is not worth considering anymore. Changing this value has little to no bearing on consensus,
-// and really only affects the work that the node might do on startup during periods of many disputes.
-const ACTIVE_DURATION_SECS: Timestamp = 180;
-
-/// Timestamp based on the 1 Jan 1970 UNIX base, which is persistent across node restarts and OS reboots.
-type Timestamp = u64;
-
-#[derive(Eq, PartialEq)]
-enum Participation {
-	Pending,
-	Complete,
-}
-
-impl Participation {
-	fn complete(&mut self) -> bool {
-		let complete = *self == Participation::Complete;
-		if !complete {
-			*self = Participation::Complete
-		}
-		complete
-	}
-}
-
-struct State {
+/// An implementation of the dispute coordinator subsystem.
+pub struct DisputeCoordinatorSubsystem {
+	config: Config,
+	store: Arc<dyn Database>,
 	keystore: Arc<LocalKeystore>,
-	highest_session: Option<SessionIndex>,
-	rolling_session_window: RollingSessionWindow,
-	recovery_state: Participation,
+	metrics: Metrics,
 }
 
 /// Configuration for the dispute coordinator subsystem.
@@ -111,896 +124,289 @@ impl Config {
 	}
 }
 
-/// An implementation of the dispute coordinator subsystem.
-pub struct DisputeCoordinatorSubsystem {
-	config: Config,
-	store: Arc<dyn KeyValueDB>,
-	keystore: Arc<LocalKeystore>,
-}
-
-impl DisputeCoordinatorSubsystem {
-	/// Create a new instance of the subsystem.
-	pub fn new(store: Arc<dyn KeyValueDB>, config: Config, keystore: Arc<LocalKeystore>) -> Self {
-		DisputeCoordinatorSubsystem { store, config, keystore }
-	}
-}
-
 impl<Context> overseer::Subsystem<Context, SubsystemError> for DisputeCoordinatorSubsystem
 where
 	Context: SubsystemContext<Message = DisputeCoordinatorMessage>,
 	Context: overseer::SubsystemContext<Message = DisputeCoordinatorMessage>,
 {
 	fn start(self, ctx: Context) -> SpawnedSubsystem {
-		let backend = DbBackend::new(self.store.clone(), self.config.column_config());
-		let future = run(self, ctx, backend, Box::new(SystemClock)).map(|_| Ok(())).boxed();
+		let future = async {
+			let backend = DbBackend::new(self.store.clone(), self.config.column_config());
+			self.run(ctx, backend, Box::new(SystemClock))
+				.await
+				.map_err(|e| SubsystemError::with_origin("dispute-coordinator", e))
+		}
+		.boxed();
 
 		SpawnedSubsystem { name: "dispute-coordinator-subsystem", future }
 	}
 }
 
-trait Clock: Send + Sync {
-	fn now(&self) -> Timestamp;
-}
+impl DisputeCoordinatorSubsystem {
+	/// Create a new instance of the subsystem.
+	pub fn new(
+		store: Arc<dyn Database>,
+		config: Config,
+		keystore: Arc<LocalKeystore>,
+		metrics: Metrics,
+	) -> Self {
+		Self { store, config, keystore, metrics }
+	}
 
-struct SystemClock;
+	/// Initialize and afterwards run `Initialized::run`.
+	async fn run<B, Context>(
+		self,
+		mut ctx: Context,
+		backend: B,
+		clock: Box<dyn Clock>,
+	) -> FatalResult<()>
+	where
+		Context: overseer::SubsystemContext<Message = DisputeCoordinatorMessage>,
+		Context: SubsystemContext<Message = DisputeCoordinatorMessage>,
+		B: Backend + 'static,
+	{
+		let res = self.initialize(&mut ctx, backend, &*clock).await?;
 
-impl Clock for SystemClock {
-	fn now(&self) -> Timestamp {
-		// `SystemTime` is notoriously non-monotonic, so our timers might not work
-		// exactly as expected.
-		//
-		// Regardless, disputes are considered active based on an order of minutes,
-		// so a few seconds of slippage in either direction shouldn't affect the
-		// amount of work the node is doing significantly.
-		match SystemTime::now().duration_since(UNIX_EPOCH) {
-			Ok(d) => d.as_secs(),
+		let (participations, votes, first_leaf, initialized, backend) = match res {
+			// Concluded:
+			None => return Ok(()),
+			Some(r) => r,
+		};
+
+		initialized
+			.run(ctx, backend, participations, votes, Some(first_leaf), clock)
+			.await
+	}
+
+	/// Make sure to recover participations properly on startup.
+	async fn initialize<B, Context>(
+		self,
+		ctx: &mut Context,
+		mut backend: B,
+		clock: &(dyn Clock),
+	) -> FatalResult<
+		Option<(
+			Vec<(ParticipationPriority, ParticipationRequest)>,
+			Vec<ScrapedOnChainVotes>,
+			ActivatedLeaf,
+			Initialized,
+			B,
+		)>,
+	>
+	where
+		Context: overseer::SubsystemContext<Message = DisputeCoordinatorMessage>,
+		Context: SubsystemContext<Message = DisputeCoordinatorMessage>,
+		B: Backend + 'static,
+	{
+		loop {
+			let (first_leaf, rolling_session_window) = match get_rolling_session_window(ctx).await {
+				Ok(Some(update)) => update,
+				Ok(None) => {
+					gum::info!(target: LOG_TARGET, "received `Conclude` signal, exiting");
+					return Ok(None)
+				},
+				Err(e) => {
+					e.split()?.log();
+					continue
+				},
+			};
+
+			let mut overlay_db = OverlayedBackend::new(&mut backend);
+			let (participations, votes, spam_slots, ordering_provider) = match self
+				.handle_startup(
+					ctx,
+					first_leaf.clone(),
+					&rolling_session_window,
+					&mut overlay_db,
+					clock,
+				)
+				.await
+			{
+				Ok(v) => v,
+				Err(e) => {
+					e.split()?.log();
+					continue
+				},
+			};
+			if !overlay_db.is_empty() {
+				let ops = overlay_db.into_write_ops();
+				backend.write(ops)?;
+			}
+
+			return Ok(Some((
+				participations,
+				votes,
+				first_leaf,
+				Initialized::new(self, rolling_session_window, spam_slots, ordering_provider),
+				backend,
+			)))
+		}
+	}
+
+	// Restores the subsystem's state before proceeding with the main event loop.
+	//
+	// - Prune any old disputes.
+	// - Find disputes we need to participate in.
+	// - Initialize spam slots & OrderingProvider.
+	async fn handle_startup<Context>(
+		&self,
+		ctx: &mut Context,
+		initial_head: ActivatedLeaf,
+		rolling_session_window: &RollingSessionWindow,
+		overlay_db: &mut OverlayedBackend<'_, impl Backend>,
+		clock: &dyn Clock,
+	) -> Result<(
+		Vec<(ParticipationPriority, ParticipationRequest)>,
+		Vec<ScrapedOnChainVotes>,
+		SpamSlots,
+		ChainScraper,
+	)>
+	where
+		Context: overseer::SubsystemContext<Message = DisputeCoordinatorMessage>,
+		Context: SubsystemContext<Message = DisputeCoordinatorMessage>,
+	{
+		// Prune obsolete disputes:
+		db::v1::note_current_session(overlay_db, rolling_session_window.latest_session())?;
+
+		let active_disputes = match overlay_db.load_recent_disputes() {
+			Ok(Some(disputes)) =>
+				get_active_with_status(disputes.into_iter(), clock.now()).collect(),
+			Ok(None) => Vec::new(),
 			Err(e) => {
-				tracing::warn!(
-					target: LOG_TARGET,
-					err = ?e,
-					"Current time is before unix epoch. Validation will not work correctly."
-				);
-
-				0
+				gum::error!(target: LOG_TARGET, "Failed initial load of recent disputes: {:?}", e);
+				return Err(e.into())
 			},
+		};
+
+		let mut participation_requests = Vec::new();
+		let mut unconfirmed_disputes: UnconfirmedDisputes = UnconfirmedDisputes::new();
+		let (mut scraper, votes) = ChainScraper::new(ctx.sender(), initial_head).await?;
+		for ((session, ref candidate_hash), status) in active_disputes {
+			let votes: CandidateVotes =
+				match overlay_db.load_candidate_votes(session, candidate_hash) {
+					Ok(Some(votes)) => votes.into(),
+					Ok(None) => continue,
+					Err(e) => {
+						gum::error!(
+							target: LOG_TARGET,
+							"Failed initial load of candidate votes: {:?}",
+							e
+						);
+						continue
+					},
+				};
+
+			let validators = match rolling_session_window.session_info(session) {
+				None => {
+					gum::warn!(
+						target: LOG_TARGET,
+						session,
+						"Missing info for session which has an active dispute",
+					);
+					continue
+				},
+				Some(info) => info.validators.clone(),
+			};
+
+			let n_validators = validators.len();
+			let voted_indices: HashSet<_> = votes.voted_indices().into_iter().collect();
+
+			// Determine if there are any missing local statements for this dispute. Validators are
+			// filtered if:
+			//  1) their statement already exists, or
+			//  2) the validator key is not in the local keystore (i.e. the validator is remote).
+			// The remaining set only contains local validators that are also missing statements.
+			let missing_local_statement = validators
+				.iter()
+				.enumerate()
+				.map(|(index, validator)| (ValidatorIndex(index as _), validator))
+				.any(|(index, validator)| {
+					!voted_indices.contains(&index) &&
+						self.keystore
+							.key_pair::<ValidatorPair>(validator)
+							.ok()
+							.map_or(false, |v| v.is_some())
+				});
+
+			let is_included = scraper.is_candidate_included(&votes.candidate_receipt.hash());
+
+			if !status.is_confirmed_concluded() && !is_included {
+				unconfirmed_disputes.insert((session, *candidate_hash), voted_indices);
+			}
+
+			// Participate for all non-concluded disputes which do not have a
+			// recorded local statement.
+			if missing_local_statement {
+				participation_requests.push((
+					ParticipationPriority::with_priority_if(is_included),
+					ParticipationRequest::new(
+						votes.candidate_receipt.clone(),
+						session,
+						n_validators,
+					),
+				));
+			}
 		}
+
+		Ok((
+			participation_requests,
+			votes,
+			SpamSlots::recover_from_state(unconfirmed_disputes),
+			scraper,
+		))
 	}
 }
 
-#[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)]
-pub enum Error {
-	#[error(transparent)]
-	RuntimeApi(#[from] RuntimeApiError),
-
-	#[error(transparent)]
-	ChainApi(#[from] ChainApiError),
-
-	#[error(transparent)]
-	Io(#[from] std::io::Error),
-
-	#[error(transparent)]
-	Oneshot(#[from] oneshot::Canceled),
-
-	#[error("Oneshot send failed")]
-	OneshotSend,
-
-	#[error(transparent)]
-	Subsystem(#[from] SubsystemError),
-
-	#[error(transparent)]
-	Codec(#[from] CodecError),
-}
-
-impl From<db::v1::Error> for Error {
-	fn from(err: db::v1::Error) -> Self {
-		match err {
-			db::v1::Error::Io(io) => Self::Io(io),
-			db::v1::Error::Codec(e) => Self::Codec(e),
-		}
-	}
-}
-
-impl Error {
-	fn trace(&self) {
-		match self {
-			// don't spam the log with spurious errors
-			Self::RuntimeApi(_) | Self::Oneshot(_) =>
-				tracing::debug!(target: LOG_TARGET, err = ?self),
-			// it's worth reporting otherwise
-			_ => tracing::warn!(target: LOG_TARGET, err = ?self),
-		}
-	}
-}
-
-/// The status of dispute. This is a state machine which can be altered by the
-/// helper methods.
-#[derive(Debug, Clone, Copy, Encode, Decode, PartialEq)]
-pub enum DisputeStatus {
-	/// The dispute is active and unconcluded.
-	#[codec(index = 0)]
-	Active,
-	/// The dispute has been concluded in favor of the candidate
-	/// since the given timestamp.
-	#[codec(index = 1)]
-	ConcludedFor(Timestamp),
-	/// The dispute has been concluded against the candidate
-	/// since the given timestamp.
-	///
-	/// This takes precedence over `ConcludedFor` in the case that
-	/// both are true, which is impossible unless a large amount of
-	/// validators are participating on both sides.
-	#[codec(index = 2)]
-	ConcludedAgainst(Timestamp),
-}
-
-impl DisputeStatus {
-	/// Initialize the status to the active state.
-	pub fn active() -> DisputeStatus {
-		DisputeStatus::Active
-	}
-
-	/// Transition the status to a new status after observing the dispute has concluded for the candidate.
-	/// This may be a no-op if the status was already concluded.
-	pub fn concluded_for(self, now: Timestamp) -> DisputeStatus {
-		match self {
-			DisputeStatus::Active => DisputeStatus::ConcludedFor(now),
-			DisputeStatus::ConcludedFor(at) => DisputeStatus::ConcludedFor(std::cmp::min(at, now)),
-			against => against,
-		}
-	}
-
-	/// Transition the status to a new status after observing the dispute has concluded against the candidate.
-	/// This may be a no-op if the status was already concluded.
-	pub fn concluded_against(self, now: Timestamp) -> DisputeStatus {
-		match self {
-			DisputeStatus::Active => DisputeStatus::ConcludedAgainst(now),
-			DisputeStatus::ConcludedFor(at) =>
-				DisputeStatus::ConcludedAgainst(std::cmp::min(at, now)),
-			DisputeStatus::ConcludedAgainst(at) =>
-				DisputeStatus::ConcludedAgainst(std::cmp::min(at, now)),
-		}
-	}
-
-	/// Whether the disputed candidate is possibly invalid.
-	pub fn is_possibly_invalid(&self) -> bool {
-		match self {
-			DisputeStatus::Active | DisputeStatus::ConcludedAgainst(_) => true,
-			DisputeStatus::ConcludedFor(_) => false,
-		}
-	}
-
-	/// Yields the timestamp this dispute concluded at, if any.
-	pub fn concluded_at(&self) -> Option<Timestamp> {
-		match self {
-			DisputeStatus::Active => None,
-			DisputeStatus::ConcludedFor(at) | DisputeStatus::ConcludedAgainst(at) => Some(*at),
-		}
-	}
-}
-
-async fn run<B, Context>(
-	subsystem: DisputeCoordinatorSubsystem,
-	mut ctx: Context,
-	mut backend: B,
-	clock: Box<dyn Clock>,
-) where
-	Context: overseer::SubsystemContext<Message = DisputeCoordinatorMessage>,
-	Context: SubsystemContext<Message = DisputeCoordinatorMessage>,
-	B: Backend,
-{
-	loop {
-		let res = run_until_error(&mut ctx, &subsystem, &mut backend, &*clock).await;
-		match res {
-			Err(e) => {
-				e.trace();
-
-				if let Error::Subsystem(SubsystemError::Context(_)) = e {
-					break
-				}
-			},
-			Ok(()) => {
-				tracing::info!(target: LOG_TARGET, "received `Conclude` signal, exiting");
-				break
-			},
-		}
-	}
-}
-
-// Run the subsystem until an error is encountered or a `conclude` signal is received.
-// Most errors are non-fatal and should lead to another call to this function.
-//
-// A return value of `Ok` indicates that an exit should be made, while non-fatal errors
-// lead to another call to this function.
-async fn run_until_error<B, Context>(
+/// Wait for `ActiveLeavesUpdate` on startup, returns `None` if `Conclude` signal came first.
+async fn get_rolling_session_window<Context>(
 	ctx: &mut Context,
-	subsystem: &DisputeCoordinatorSubsystem,
-	backend: &mut B,
-	clock: &dyn Clock,
-) -> Result<(), Error>
+) -> Result<Option<(ActivatedLeaf, RollingSessionWindow)>>
 where
 	Context: overseer::SubsystemContext<Message = DisputeCoordinatorMessage>,
 	Context: SubsystemContext<Message = DisputeCoordinatorMessage>,
-	B: Backend,
 {
-	let mut state = State {
-		keystore: subsystem.keystore.clone(),
-		highest_session: None,
-		rolling_session_window: RollingSessionWindow::new(DISPUTE_WINDOW),
-		recovery_state: Participation::Pending,
-	};
+	if let Some(leaf) = wait_for_first_leaf(ctx).await? {
+		Ok(Some((
+			leaf.clone(),
+			RollingSessionWindow::new(ctx, DISPUTE_WINDOW, leaf.hash)
+				.await
+				.map_err(JfyiError::RollingSessionWindow)?,
+		)))
+	} else {
+		Ok(None)
+	}
+}
 
+/// Wait for `ActiveLeavesUpdate`, returns `None` if `Conclude` signal came first.
+async fn wait_for_first_leaf<Context>(ctx: &mut Context) -> Result<Option<ActivatedLeaf>>
+where
+	Context: overseer::SubsystemContext<Message = DisputeCoordinatorMessage>,
+	Context: SubsystemContext<Message = DisputeCoordinatorMessage>,
+{
 	loop {
-		let mut overlay_db = OverlayedBackend::new(backend);
 		match ctx.recv().await? {
-			FromOverseer::Signal(OverseerSignal::Conclude) => return Ok(()),
+			FromOverseer::Signal(OverseerSignal::Conclude) => return Ok(None),
 			FromOverseer::Signal(OverseerSignal::ActiveLeaves(update)) => {
-				handle_new_activations(
-					ctx,
-					&mut overlay_db,
-					&mut state,
-					update.activated.into_iter().map(|a| a.hash),
-				)
-				.await?;
-				if !state.recovery_state.complete() {
-					handle_startup(ctx, &mut overlay_db, &mut state).await?;
+				if let Some(activated) = update.activated {
+					return Ok(Some(activated))
 				}
 			},
 			FromOverseer::Signal(OverseerSignal::BlockFinalized(_, _)) => {},
 			FromOverseer::Communication { msg } =>
-				handle_incoming(ctx, &mut overlay_db, &mut state, msg, clock.now()).await?,
-		}
-
-		if !overlay_db.is_empty() {
-			let ops = overlay_db.into_write_ops();
-			backend.write(ops)?;
-		}
-	}
-}
-
-// Restores the subsystem's state before proceeding with the main event loop. Primarily, this
-// repopulates the rolling session window the relevant session information to handle incoming
-// import statement requests.
-//
-// This method also retransmits a `DisputeParticiationMessage::Participate` for any non-concluded
-// disputes for which the subsystem doesn't have a local statement, ensuring it eventually makes an
-// arbitration on the dispute.
-async fn handle_startup<Context>(
-	ctx: &mut Context,
-	overlay_db: &mut OverlayedBackend<'_, impl Backend>,
-	state: &mut State,
-) -> Result<(), Error>
-where
-	Context: overseer::SubsystemContext<Message = DisputeCoordinatorMessage>,
-	Context: SubsystemContext<Message = DisputeCoordinatorMessage>,
-{
-	let recent_disputes = match overlay_db.load_recent_disputes() {
-		Ok(Some(disputes)) => disputes,
-		Ok(None) => return Ok(()),
-		Err(e) => {
-			tracing::error!(target: LOG_TARGET, "Failed initial load of recent disputes: {:?}", e);
-			return Err(e.into())
-		},
-	};
-
-	// Filter out disputes that have already concluded.
-	let active_disputes = recent_disputes
-		.into_iter()
-		.filter(|(_, status)| *status == DisputeStatus::Active)
-		.collect::<RecentDisputes>();
-
-	for ((session, ref candidate_hash), _) in active_disputes.into_iter() {
-		let votes: CandidateVotes = match overlay_db.load_candidate_votes(session, candidate_hash) {
-			Ok(Some(votes)) => votes.into(),
-			Ok(None) => continue,
-			Err(e) => {
-				tracing::error!(
+			// NOTE: We could technically actually handle a couple of message types, even if
+			// not initialized (e.g. all requests that only query the database). The problem
+			// is, we would deliver potentially outdated information, especially in the event
+			// of bugs where initialization fails for a while (e.g. `SessionInfo`s are not
+			// available). So instead of telling subsystems, everything is fine, because of an
+			// hour old database state, we should rather cancel contained oneshots and delay
+			// finality until we are fully functional.
+			{
+				gum::warn!(
 					target: LOG_TARGET,
-					"Failed initial load of candidate votes: {:?}",
-					e
-				);
-				continue
-			},
-		};
-
-		let validators = match state.rolling_session_window.session_info(session) {
-			None => {
-				tracing::warn!(
-					target: LOG_TARGET,
-					session,
-					"Missing info for session which has an active dispute",
-				);
-				continue
-			},
-			Some(info) => info.validators.clone(),
-		};
-
-		let n_validators = validators.len();
-		let voted_indices: HashSet<_> = votes.voted_indices().into_iter().collect();
-
-		// Determine if there are any missing local statements for this dispute. Validators are
-		// filtered if:
-		//  1) their statement already exists, or
-		//  2) the validator key is not in the local keystore (i.e. the validator is remote).
-		// The remaining set only contains local validators that are also missing statements.
-		let missing_local_statement = validators
-			.iter()
-			.enumerate()
-			.map(|(index, validator)| (ValidatorIndex(index as _), validator))
-			.any(|(index, validator)| {
-				!voted_indices.contains(&index) &&
-					state
-						.keystore
-						.key_pair::<ValidatorPair>(validator)
-						.ok()
-						.map_or(false, |v| v.is_some())
-			});
-
-		// Send a `DisputeParticipationMessage` for all non-concluded disputes which do not have a
-		// recorded local statement.
-		if missing_local_statement {
-			let (report_availability, receive_availability) = oneshot::channel();
-			ctx.send_message(DisputeParticipationMessage::Participate {
-				candidate_hash: *candidate_hash,
-				candidate_receipt: votes.candidate_receipt.clone(),
-				session,
-				n_validators: n_validators as u32,
-				report_availability,
-			})
-			.await;
-
-			if !receive_availability.await? {
-				tracing::debug!(
-					target: LOG_TARGET,
-					"Participation failed. Candidate not available"
-				);
-			}
-		}
-	}
-
-	Ok(())
-}
-
-async fn handle_new_activations(
-	ctx: &mut (impl SubsystemContext<Message = DisputeCoordinatorMessage>
-	          + overseer::SubsystemContext<Message = DisputeCoordinatorMessage>),
-	overlay_db: &mut OverlayedBackend<'_, impl Backend>,
-	state: &mut State,
-	new_activations: impl IntoIterator<Item = Hash>,
-) -> Result<(), Error> {
-	for new_leaf in new_activations {
-		let block_header = {
-			let (tx, rx) = oneshot::channel();
-
-			ctx.send_message(ChainApiMessage::BlockHeader(new_leaf, tx)).await;
-
-			match rx.await?? {
-				None => continue,
-				Some(header) => header,
-			}
-		};
-
-		match state
-			.rolling_session_window
-			.cache_session_info_for_head(ctx, new_leaf, &block_header)
-			.await
-		{
-			Err(e) => {
-				tracing::warn!(
-					target: LOG_TARGET,
-					err = ?e,
-					"Failed to update session cache for disputes",
-				);
-
-				continue
-			},
-			Ok(SessionWindowUpdate::Initialized { window_end, .. }) |
-			Ok(SessionWindowUpdate::Advanced { new_window_end: window_end, .. }) => {
-				let session = window_end;
-				if state.highest_session.map_or(true, |s| s < session) {
-					tracing::trace!(target: LOG_TARGET, session, "Observed new session. Pruning");
-
-					state.highest_session = Some(session);
-
-					db::v1::note_current_session(overlay_db, session)?;
-				}
-			},
-			_ => {},
-		}
-	}
-
-	Ok(())
-}
-
-async fn handle_incoming(
-	ctx: &mut impl SubsystemContext,
-	overlay_db: &mut OverlayedBackend<'_, impl Backend>,
-	state: &mut State,
-	message: DisputeCoordinatorMessage,
-	now: Timestamp,
-) -> Result<(), Error> {
-	match message {
-		DisputeCoordinatorMessage::ImportStatements {
-			candidate_hash,
-			candidate_receipt,
-			session,
-			statements,
-			pending_confirmation,
-		} => {
-			handle_import_statements(
-				ctx,
-				overlay_db,
-				state,
-				candidate_hash,
-				candidate_receipt,
-				session,
-				statements,
-				now,
-				pending_confirmation,
-			)
-			.await?;
-		},
-		DisputeCoordinatorMessage::RecentDisputes(rx) => {
-			let recent_disputes = overlay_db.load_recent_disputes()?.unwrap_or_default();
-			let _ = rx.send(recent_disputes.keys().cloned().collect());
-		},
-		DisputeCoordinatorMessage::ActiveDisputes(rx) => {
-			let recent_disputes = overlay_db.load_recent_disputes()?.unwrap_or_default();
-			let _ = rx.send(collect_active(recent_disputes, now));
-		},
-		DisputeCoordinatorMessage::QueryCandidateVotes(query, rx) => {
-			let mut query_output = Vec::new();
-			for (session_index, candidate_hash) in query.into_iter() {
-				if let Some(v) = overlay_db.load_candidate_votes(session_index, &candidate_hash)? {
-					query_output.push((session_index, candidate_hash, v.into()));
-				} else {
-					tracing::debug!(
-						target: LOG_TARGET,
-						session_index,
-						"No votes found for candidate",
-					);
-				}
-			}
-			let _ = rx.send(query_output);
-		},
-		DisputeCoordinatorMessage::IssueLocalStatement(
-			session,
-			candidate_hash,
-			candidate_receipt,
-			valid,
-		) => {
-			issue_local_statement(
-				ctx,
-				overlay_db,
-				state,
-				candidate_hash,
-				candidate_receipt,
-				session,
-				valid,
-				now,
-			)
-			.await?;
-		},
-		DisputeCoordinatorMessage::DetermineUndisputedChain {
-			base_number,
-			block_descriptions,
-			tx,
-		} => {
-			let undisputed_chain =
-				determine_undisputed_chain(overlay_db, base_number, block_descriptions)?;
-
-			let _ = tx.send(undisputed_chain);
-		},
-	}
-
-	Ok(())
-}
-
-fn collect_active(
-	recent_disputes: RecentDisputes,
-	now: Timestamp,
-) -> Vec<(SessionIndex, CandidateHash)> {
-	recent_disputes
-		.iter()
-		.filter_map(|(disputed, status)| {
-			status
-				.concluded_at()
-				.filter(|at| at + ACTIVE_DURATION_SECS < now)
-				.map_or(Some(*disputed), |_| None)
-		})
-		.collect()
-}
-
-fn insert_into_statement_vec<T>(
-	vec: &mut Vec<(T, ValidatorIndex, ValidatorSignature)>,
-	tag: T,
-	val_index: ValidatorIndex,
-	val_signature: ValidatorSignature,
-) {
-	let pos = match vec.binary_search_by_key(&val_index, |x| x.1) {
-		Ok(_) => return, // no duplicates needed.
-		Err(p) => p,
-	};
-
-	vec.insert(pos, (tag, val_index, val_signature));
-}
-
-async fn handle_import_statements(
-	ctx: &mut impl SubsystemContext,
-	overlay_db: &mut OverlayedBackend<'_, impl Backend>,
-	state: &mut State,
-	candidate_hash: CandidateHash,
-	candidate_receipt: CandidateReceipt,
-	session: SessionIndex,
-	statements: Vec<(SignedDisputeStatement, ValidatorIndex)>,
-	now: Timestamp,
-	pending_confirmation: oneshot::Sender<ImportStatementsResult>,
-) -> Result<(), Error> {
-	if state.highest_session.map_or(true, |h| session + DISPUTE_WINDOW < h) {
-		// It is not valid to participate in an ancient dispute (spam?).
-		pending_confirmation
-			.send(ImportStatementsResult::InvalidImport)
-			.map_err(|_| Error::OneshotSend)?;
-
-		return Ok(())
-	}
-
-	let validators = match state.rolling_session_window.session_info(session) {
-		None => {
-			tracing::warn!(
-				target: LOG_TARGET,
-				session,
-				"Missing info for session which has an active dispute",
-			);
-
-			pending_confirmation
-				.send(ImportStatementsResult::InvalidImport)
-				.map_err(|_| Error::OneshotSend)?;
-
-			return Ok(())
-		},
-		Some(info) => info.validators.clone(),
-	};
-
-	let n_validators = validators.len();
-
-	let supermajority_threshold = polkadot_primitives::v1::supermajority_threshold(n_validators);
-
-	let mut votes = overlay_db
-		.load_candidate_votes(session, &candidate_hash)?
-		.map(CandidateVotes::from)
-		.unwrap_or_else(|| CandidateVotes {
-			candidate_receipt: candidate_receipt.clone(),
-			valid: Vec::new(),
-			invalid: Vec::new(),
-		});
-
-	// Update candidate votes.
-	for (statement, val_index) in statements {
-		if validators
-			.get(val_index.0 as usize)
-			.map_or(true, |v| v != statement.validator_public())
-		{
-			tracing::debug!(
-				target: LOG_TARGET,
-				?val_index,
-				session,
-				claimed_key = ?statement.validator_public(),
-				"Validator index doesn't match claimed key",
-			);
-
-			continue
-		}
-
-		match statement.statement().clone() {
-			DisputeStatement::Valid(valid_kind) => {
-				insert_into_statement_vec(
-					&mut votes.valid,
-					valid_kind,
-					val_index,
-					statement.validator_signature().clone(),
-				);
-			},
-			DisputeStatement::Invalid(invalid_kind) => {
-				insert_into_statement_vec(
-					&mut votes.invalid,
-					invalid_kind,
-					val_index,
-					statement.validator_signature().clone(),
-				);
+					?msg,
+					"Received msg before first active leaves update. This is not expected - message will be dropped."
+				)
 			},
 		}
 	}
-
-	// Check if newly disputed.
-	let is_disputed = !votes.valid.is_empty() && !votes.invalid.is_empty();
-	let concluded_valid = votes.valid.len() >= supermajority_threshold;
-	let concluded_invalid = votes.invalid.len() >= supermajority_threshold;
-
-	let mut recent_disputes = overlay_db.load_recent_disputes()?.unwrap_or_default();
-
-	let prev_status = recent_disputes.get(&(session, candidate_hash)).map(|x| x.clone());
-
-	let status = if is_disputed {
-		let status = recent_disputes
-			.entry((session, candidate_hash))
-			.or_insert(DisputeStatus::active());
-
-		// Note: concluded-invalid overwrites concluded-valid,
-		// so we do this check first. Dispute state machine is
-		// non-commutative.
-		if concluded_valid {
-			*status = status.concluded_for(now);
-		}
-
-		if concluded_invalid {
-			*status = status.concluded_against(now);
-		}
-
-		Some(*status)
-	} else {
-		None
-	};
-
-	if status != prev_status {
-		// This branch is only hit when the candidate is freshly disputed -
-		// status was previously `None`, and now is not.
-		if prev_status.is_none() {
-			// No matter what, if the dispute is new, we participate.
-			//
-			// We also block the coordinator while awaiting our determination
-			// of whether the vote is available.
-			let (report_availability, receive_availability) = oneshot::channel();
-			ctx.send_message(DisputeParticipationMessage::Participate {
-				candidate_hash,
-				candidate_receipt,
-				session,
-				n_validators: n_validators as u32,
-				report_availability,
-			})
-			.await;
-
-			if !receive_availability.await.map_err(Error::Oneshot)? {
-				// If the data is not available, we disregard the dispute votes.
-				// This is an indication that the dispute does not correspond to any included
-				// candidate and that it should be ignored.
-				//
-				// We expect that if the candidate is truly disputed that the higher-level network
-				// code will retry.
-				pending_confirmation
-					.send(ImportStatementsResult::InvalidImport)
-					.map_err(|_| Error::OneshotSend)?;
-
-				tracing::debug!(
-					target: LOG_TARGET,
-					"Recovering availability failed - invalid import."
-				);
-				return Ok(())
-			}
-		}
-
-		// Only write when updated and vote is available.
-		overlay_db.write_recent_disputes(recent_disputes);
-	}
-
-	overlay_db.write_candidate_votes(session, candidate_hash, votes.into());
-
-	pending_confirmation
-		.send(ImportStatementsResult::ValidImport)
-		.map_err(|_| Error::OneshotSend)?;
-
-	Ok(())
-}
-
-async fn issue_local_statement(
-	ctx: &mut impl SubsystemContext,
-	overlay_db: &mut OverlayedBackend<'_, impl Backend>,
-	state: &mut State,
-	candidate_hash: CandidateHash,
-	candidate_receipt: CandidateReceipt,
-	session: SessionIndex,
-	valid: bool,
-	now: Timestamp,
-) -> Result<(), Error> {
-	// Load session info.
-	let info = match state.rolling_session_window.session_info(session) {
-		None => {
-			tracing::warn!(
-				target: LOG_TARGET,
-				session,
-				"Missing info for session which has an active dispute",
-			);
-
-			return Ok(())
-		},
-		Some(info) => info,
-	};
-
-	let validators = info.validators.clone();
-
-	let votes = overlay_db
-		.load_candidate_votes(session, &candidate_hash)?
-		.map(CandidateVotes::from)
-		.unwrap_or_else(|| CandidateVotes {
-			candidate_receipt: candidate_receipt.clone(),
-			valid: Vec::new(),
-			invalid: Vec::new(),
-		});
-
-	// Sign a statement for each validator index we control which has
-	// not already voted. This should generally be maximum 1 statement.
-	let voted_indices = votes.voted_indices();
-	let mut statements = Vec::new();
-
-	let voted_indices: HashSet<_> = voted_indices.into_iter().collect();
-	for (index, validator) in validators.iter().enumerate() {
-		let index = ValidatorIndex(index as _);
-		if voted_indices.contains(&index) {
-			continue
-		}
-		if state.keystore.key_pair::<ValidatorPair>(validator).ok().flatten().is_none() {
-			continue
-		}
-
-		let keystore = state.keystore.clone() as Arc<_>;
-		let res = SignedDisputeStatement::sign_explicit(
-			&keystore,
-			valid,
-			candidate_hash,
-			session,
-			validator.clone(),
-		)
-		.await;
-
-		match res {
-			Ok(Some(signed_dispute_statement)) => {
-				statements.push((signed_dispute_statement, index));
-			},
-			Ok(None) => {},
-			Err(e) => {
-				tracing::error!(
-					target: LOG_TARGET,
-					err = ?e,
-					"Encountered keystore error while signing dispute statement",
-				);
-			},
-		}
-	}
-
-	// Get our message out:
-	for (statement, index) in &statements {
-		let dispute_message = match make_dispute_message(info, &votes, statement.clone(), *index) {
-			Err(err) => {
-				tracing::debug!(target: LOG_TARGET, ?err, "Creating dispute message failed.");
-				continue
-			},
-			Ok(dispute_message) => dispute_message,
-		};
-
-		ctx.send_message(DisputeDistributionMessage::SendDispute(dispute_message)).await;
-	}
-
-	// Do import
-	if !statements.is_empty() {
-		let (pending_confirmation, _rx) = oneshot::channel();
-		handle_import_statements(
-			ctx,
-			overlay_db,
-			state,
-			candidate_hash,
-			candidate_receipt,
-			session,
-			statements,
-			now,
-			pending_confirmation,
-		)
-		.await?;
-	}
-
-	Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-enum DisputeMessageCreationError {
-	#[error("There was no opposite vote available")]
-	NoOppositeVote,
-	#[error("Found vote had an invalid validator index that could not be found")]
-	InvalidValidatorIndex,
-	#[error("Statement found in votes had invalid signature.")]
-	InvalidStoredStatement,
-	#[error(transparent)]
-	InvalidStatementCombination(DisputeMessageCheckError),
-}
-
-fn make_dispute_message(
-	info: &SessionInfo,
-	votes: &CandidateVotes,
-	our_vote: SignedDisputeStatement,
-	our_index: ValidatorIndex,
-) -> Result<DisputeMessage, DisputeMessageCreationError> {
-	let validators = &info.validators;
-
-	let (valid_statement, valid_index, invalid_statement, invalid_index) =
-		if let DisputeStatement::Valid(_) = our_vote.statement() {
-			let (statement_kind, validator_index, validator_signature) =
-				votes.invalid.get(0).ok_or(DisputeMessageCreationError::NoOppositeVote)?.clone();
-			let other_vote = SignedDisputeStatement::new_checked(
-				DisputeStatement::Invalid(statement_kind),
-				our_vote.candidate_hash().clone(),
-				our_vote.session_index(),
-				validators
-					.get(validator_index.0 as usize)
-					.ok_or(DisputeMessageCreationError::InvalidValidatorIndex)?
-					.clone(),
-				validator_signature,
-			)
-			.map_err(|()| DisputeMessageCreationError::InvalidStoredStatement)?;
-			(our_vote, our_index, other_vote, validator_index)
-		} else {
-			let (statement_kind, validator_index, validator_signature) =
-				votes.valid.get(0).ok_or(DisputeMessageCreationError::NoOppositeVote)?.clone();
-			let other_vote = SignedDisputeStatement::new_checked(
-				DisputeStatement::Valid(statement_kind),
-				our_vote.candidate_hash().clone(),
-				our_vote.session_index(),
-				validators
-					.get(validator_index.0 as usize)
-					.ok_or(DisputeMessageCreationError::InvalidValidatorIndex)?
-					.clone(),
-				validator_signature,
-			)
-			.map_err(|()| DisputeMessageCreationError::InvalidStoredStatement)?;
-			(other_vote, validator_index, our_vote, our_index)
-		};
-
-	DisputeMessage::from_signed_statements(
-		valid_statement,
-		valid_index,
-		invalid_statement,
-		invalid_index,
-		votes.candidate_receipt.clone(),
-		info,
-	)
-	.map_err(DisputeMessageCreationError::InvalidStatementCombination)
-}
-
-/// Determine the the best block and its block number.
-/// Assumes `block_descriptions` are sorted from the one
-/// with the lowest `BlockNumber` to the highest.
-fn determine_undisputed_chain(
-	overlay_db: &mut OverlayedBackend<'_, impl Backend>,
-	base_number: BlockNumber,
-	block_descriptions: Vec<BlockDescription>,
-) -> Result<Option<(BlockNumber, Hash)>, Error> {
-	let last = block_descriptions
-		.last()
-		.map(|e| (base_number + block_descriptions.len() as BlockNumber, e.block_hash));
-
-	// Fast path for no disputes.
-	let recent_disputes = match overlay_db.load_recent_disputes()? {
-		None => return Ok(last),
-		Some(a) if a.is_empty() => return Ok(last),
-		Some(a) => a,
-	};
-
-	let is_possibly_invalid = |session, candidate_hash| {
-		recent_disputes
-			.get(&(session, candidate_hash))
-			.map_or(false, |status| status.is_possibly_invalid())
-	};
-
-	for (i, BlockDescription { session, candidates, .. }) in block_descriptions.iter().enumerate() {
-		if candidates.iter().any(|c| is_possibly_invalid(*session, *c)) {
-			if i == 0 {
-				return Ok(None)
-			} else {
-				return Ok(Some((
-					base_number + i as BlockNumber,
-					block_descriptions[i - 1].block_hash,
-				)))
-			}
-		}
-	}
-
-	Ok(last)
 }

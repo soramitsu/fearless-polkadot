@@ -21,13 +21,12 @@
 //! of others. It uses this information to determine when candidates and blocks have
 //! been sufficiently approved to finalize.
 
-use kvdb::KeyValueDB;
 use polkadot_node_jaeger as jaeger;
 use polkadot_node_primitives::{
 	approval::{
 		BlockApprovalMeta, DelayTranche, IndirectAssignmentCert, IndirectSignedApprovalVote,
 	},
-	SignedDisputeStatement, ValidationResult,
+	SignedDisputeStatement, ValidationResult, APPROVAL_EXECUTION_TIMEOUT,
 };
 use polkadot_node_subsystem::{
 	errors::RecoveryError,
@@ -36,18 +35,22 @@ use polkadot_node_subsystem::{
 		ApprovalVotingMessage, AssignmentCheckError, AssignmentCheckResult,
 		AvailabilityRecoveryMessage, BlockDescription, CandidateValidationMessage, ChainApiMessage,
 		ChainSelectionMessage, DisputeCoordinatorMessage, HighestApprovedAncestorBlock,
-		ImportStatementsResult, RuntimeApiMessage, RuntimeApiRequest,
+		RuntimeApiMessage, RuntimeApiRequest,
 	},
 	overseer::{self, SubsystemSender as _},
 	FromOverseer, OverseerSignal, SpawnedSubsystem, SubsystemContext, SubsystemError,
 	SubsystemResult, SubsystemSender,
 };
 use polkadot_node_subsystem_util::{
+	database::Database,
 	metrics::{self, prometheus},
-	rolling_session_window::RollingSessionWindow,
+	rolling_session_window::{
+		new_session_window_size, RollingSessionWindow, SessionWindowSize, SessionWindowUpdate,
+		SessionsUnavailable,
+	},
 	TimeoutExt,
 };
-use polkadot_primitives::v1::{
+use polkadot_primitives::v2::{
 	ApprovalVote, BlockNumber, CandidateHash, CandidateIndex, CandidateReceipt, DisputeStatement,
 	GroupIndex, Hash, SessionIndex, SessionInfo, ValidDisputeStatementKind, ValidatorId,
 	ValidatorIndex, ValidatorPair, ValidatorSignature,
@@ -65,7 +68,9 @@ use futures::{
 };
 
 use std::{
-	collections::{btree_map::Entry, BTreeMap, HashMap, HashSet},
+	collections::{
+		btree_map::Entry as BTMEntry, hash_map::Entry as HMEntry, BTreeMap, HashMap, HashSet,
+	},
 	sync::Arc,
 	time::Duration,
 };
@@ -92,10 +97,12 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
-const APPROVAL_SESSIONS: SessionIndex = 6;
+pub const APPROVAL_SESSIONS: SessionWindowSize = new_session_window_size!(6);
+
 const APPROVAL_CHECKING_TIMEOUT: Duration = Duration::from_secs(120);
 const APPROVAL_CACHE_SIZE: usize = 1024;
 const TICK_TOO_FAR_IN_FUTURE: Tick = 20; // 10 seconds.
+const APPROVAL_DELAY: Tick = 2;
 const LOG_TARGET: &str = "parachain::approval-voting";
 
 /// Configuration for the approval voting subsystem
@@ -130,7 +137,7 @@ pub struct ApprovalVotingSubsystem {
 	keystore: Arc<LocalKeystore>,
 	db_config: DatabaseConfig,
 	slot_duration_millis: u64,
-	db: Arc<dyn KeyValueDB>,
+	db: Arc<dyn Database>,
 	mode: Mode,
 	metrics: Metrics,
 }
@@ -235,7 +242,7 @@ impl metrics::Metrics for Metrics {
 		let metrics = MetricsInner {
 			imported_candidates_total: prometheus::register(
 				prometheus::Counter::new(
-					"parachain_imported_candidates_total",
+					"polkadot_parachain_imported_candidates_total",
 					"Number of candidates imported by the approval voting subsystem",
 				)?,
 				registry,
@@ -243,7 +250,7 @@ impl metrics::Metrics for Metrics {
 			assignments_produced: prometheus::register(
 				prometheus::Histogram::with_opts(
 					prometheus::HistogramOpts::new(
-						"parachain_assignments_produced",
+						"polkadot_parachain_assignments_produced",
 						"Assignments and tranches produced by the approval voting subsystem",
 					).buckets(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 15.0, 25.0, 40.0, 70.0]),
 				)?,
@@ -252,7 +259,7 @@ impl metrics::Metrics for Metrics {
 			approvals_produced_total: prometheus::register(
 				prometheus::CounterVec::new(
 					prometheus::Opts::new(
-						"parachain_approvals_produced_total",
+						"polkadot_parachain_approvals_produced_total",
 						"Number of approvals produced by the approval voting subsystem",
 					),
 					&["status"]
@@ -261,14 +268,14 @@ impl metrics::Metrics for Metrics {
 			)?,
 			no_shows_total: prometheus::register(
 				prometheus::Counter::new(
-					"parachain_approvals_no_shows_total",
+					"polkadot_parachain_approvals_no_shows_total",
 					"Number of assignments which became no-shows in the approval voting subsystem",
 				)?,
 				registry,
 			)?,
 			wakeups_triggered_total: prometheus::register(
 				prometheus::Counter::new(
-					"parachain_approvals_wakeups_total",
+					"polkadot_parachain_approvals_wakeups_total",
 					"Number of times we woke up to process a candidate in the approval voting subsystem",
 				)?,
 				registry,
@@ -276,7 +283,7 @@ impl metrics::Metrics for Metrics {
 			candidate_approval_time_ticks: prometheus::register(
 				prometheus::Histogram::with_opts(
 					prometheus::HistogramOpts::new(
-						"parachain_approvals_candidate_approval_time_ticks",
+						"polkadot_parachain_approvals_candidate_approval_time_ticks",
 						"Number of ticks (500ms) to approve candidates.",
 					).buckets(vec![6.0, 12.0, 18.0, 24.0, 30.0, 36.0, 72.0, 100.0, 144.0]),
 				)?,
@@ -285,7 +292,7 @@ impl metrics::Metrics for Metrics {
 			block_approval_time_ticks: prometheus::register(
 				prometheus::Histogram::with_opts(
 					prometheus::HistogramOpts::new(
-						"parachain_approvals_blockapproval_time_ticks",
+						"polkadot_parachain_approvals_blockapproval_time_ticks",
 						"Number of ticks (500ms) to approve blocks.",
 					).buckets(vec![6.0, 12.0, 18.0, 24.0, 30.0, 36.0, 72.0, 100.0, 144.0]),
 				)?,
@@ -294,7 +301,7 @@ impl metrics::Metrics for Metrics {
 			time_db_transaction: prometheus::register(
 				prometheus::Histogram::with_opts(
 					prometheus::HistogramOpts::new(
-						"parachain_time_approval_db_transaction",
+						"polkadot_parachain_time_approval_db_transaction",
 						"Time spent writing an approval db transaction.",
 					)
 				)?,
@@ -303,7 +310,7 @@ impl metrics::Metrics for Metrics {
 			time_recover_and_approve: prometheus::register(
 				prometheus::Histogram::with_opts(
 					prometheus::HistogramOpts::new(
-						"parachain_time_recover_and_approve",
+						"polkadot_parachain_time_recover_and_approve",
 						"Time spent recovering and approving data in approval voting",
 					)
 				)?,
@@ -319,7 +326,7 @@ impl ApprovalVotingSubsystem {
 	/// Create a new approval voting subsystem with the given keystore, config, and database.
 	pub fn with_config(
 		config: Config,
-		db: Arc<dyn KeyValueDB>,
+		db: Arc<dyn Database>,
 		keystore: Arc<LocalKeystore>,
 		sync_oracle: Box<dyn SyncOracle + Send>,
 		metrics: Metrics,
@@ -395,7 +402,7 @@ impl Wakeups {
 			}
 
 			// we are replacing previous wakeup with an earlier one.
-			if let Entry::Occupied(mut entry) = self.wakeups.entry(*prev) {
+			if let BTMEntry::Occupied(mut entry) = self.wakeups.entry(*prev) {
 				if let Some(pos) =
 					entry.get().iter().position(|x| x == &(block_hash, candidate_hash))
 				{
@@ -431,7 +438,7 @@ impl Wakeups {
 		});
 
 		for (tick, pruned) in pruned_wakeups {
-			if let Entry::Occupied(mut entry) = self.wakeups.entry(tick) {
+			if let BTMEntry::Occupied(mut entry) = self.wakeups.entry(tick) {
 				entry.get_mut().retain(|wakeup| !pruned.contains(wakeup));
 				if entry.get().is_empty() {
 					let _ = entry.remove();
@@ -452,10 +459,10 @@ impl Wakeups {
 			Some(tick) => {
 				clock.wait(tick).await;
 				match self.wakeups.entry(tick) {
-					Entry::Vacant(_) => {
+					BTMEntry::Vacant(_) => {
 						panic!("entry is known to exist since `first` was `Some`; qed")
 					},
-					Entry::Occupied(mut entry) => {
+					BTMEntry::Occupied(mut entry) => {
 						let (hash, candidate_hash) = entry.get_mut().pop()
 							.expect("empty entries are removed here and in `schedule`; no other mutation of this map; qed");
 
@@ -502,7 +509,7 @@ impl ApprovalState {
 }
 
 struct CurrentlyCheckingSet {
-	candidate_hash_map: HashMap<CandidateHash, Vec<Hash>>,
+	candidate_hash_map: HashMap<CandidateHash, HashSet<Hash>>,
 	currently_checking: FuturesUnordered<BoxFuture<'static, ApprovalState>>,
 }
 
@@ -522,21 +529,26 @@ impl CurrentlyCheckingSet {
 		relay_block: Hash,
 		launch_work: impl Future<Output = SubsystemResult<RemoteHandle<ApprovalState>>>,
 	) -> SubsystemResult<()> {
-		let val = self.candidate_hash_map.entry(candidate_hash).or_insert(Default::default());
-
-		if let Err(k) = val.binary_search_by_key(&relay_block, |v| *v) {
-			let _ = val.insert(k, relay_block);
-			let work = launch_work.await?;
-			self.currently_checking.push(Box::pin(async move {
-				match work.timeout(APPROVAL_CHECKING_TIMEOUT).await {
-					None => ApprovalState {
-						candidate_hash,
-						validator_index,
-						approval_outcome: ApprovalOutcome::TimedOut,
-					},
-					Some(approval_state) => approval_state,
-				}
-			}));
+		match self.candidate_hash_map.entry(candidate_hash) {
+			HMEntry::Occupied(mut entry) => {
+				// validation already undergoing. just add the relay hash if unknown.
+				entry.get_mut().insert(relay_block);
+			},
+			HMEntry::Vacant(entry) => {
+				// validation not ongoing. launch work and time out the remote handle.
+				entry.insert(HashSet::new()).insert(relay_block);
+				let work = launch_work.await?;
+				self.currently_checking.push(Box::pin(async move {
+					match work.timeout(APPROVAL_CHECKING_TIMEOUT).await {
+						None => ApprovalState {
+							candidate_hash,
+							validator_index,
+							approval_outcome: ApprovalOutcome::TimedOut,
+						},
+						Some(approval_state) => approval_state,
+					}
+				}));
+			},
 		}
 
 		Ok(())
@@ -545,7 +557,7 @@ impl CurrentlyCheckingSet {
 	pub async fn next(
 		&mut self,
 		approvals_cache: &mut lru::LruCache<CandidateHash, ApprovalOutcome>,
-	) -> (Vec<Hash>, ApprovalState) {
+	) -> (HashSet<Hash>, ApprovalState) {
 		if !self.currently_checking.is_empty() {
 			if let Some(approval_state) = self.currently_checking.next().await {
 				let out = self
@@ -565,7 +577,7 @@ impl CurrentlyCheckingSet {
 }
 
 struct State {
-	session_window: RollingSessionWindow,
+	session_window: Option<RollingSessionWindow>,
 	keystore: Arc<LocalKeystore>,
 	slot_duration_millis: u64,
 	clock: Box<dyn Clock + Send + Sync>,
@@ -574,9 +586,30 @@ struct State {
 
 impl State {
 	fn session_info(&self, i: SessionIndex) -> Option<&SessionInfo> {
-		self.session_window.session_info(i)
+		self.session_window.as_ref().and_then(|w| w.session_info(i))
 	}
 
+	/// Bring `session_window` up to date.
+	pub async fn cache_session_info_for_head(
+		&mut self,
+		ctx: &mut (impl SubsystemContext + overseer::SubsystemContext),
+		head: Hash,
+	) -> Result<Option<SessionWindowUpdate>, SessionsUnavailable> {
+		let session_window = self.session_window.take();
+		match session_window {
+			None => {
+				self.session_window =
+					Some(RollingSessionWindow::new(ctx, APPROVAL_SESSIONS, head).await?);
+				Ok(None)
+			},
+			Some(mut session_window) => {
+				let r =
+					session_window.cache_session_info_for_head(ctx, head).await.map(Option::Some);
+				self.session_window = Some(session_window);
+				r
+			},
+		}
+	}
 	// Compute the required tranches for approval for this block and candidate combo.
 	// Fails if there is no approval entry for the block under the candidate or no candidate entry
 	// under the block, or if the session is out of bounds.
@@ -588,7 +621,7 @@ impl State {
 		let session_info = match self.session_info(block_entry.session()) {
 			Some(s) => s,
 			None => {
-				tracing::warn!(
+				gum::warn!(
 					target: LOG_TARGET,
 					"Unknown session info for {}",
 					block_entry.session()
@@ -668,7 +701,7 @@ where
 	B: Backend,
 {
 	let mut state = State {
-		session_window: RollingSessionWindow::new(APPROVAL_SESSIONS),
+		session_window: None,
 		keystore: subsystem.keystore,
 		slot_duration_millis: subsystem.slot_duration_millis,
 		clock,
@@ -679,7 +712,17 @@ where
 	let mut currently_checking_set = CurrentlyCheckingSet::default();
 	let mut approvals_cache = lru::LruCache::new(APPROVAL_CACHE_SIZE);
 
-	let mut last_finalized_height: Option<BlockNumber> = None;
+	let mut last_finalized_height: Option<BlockNumber> = {
+		let (tx, rx) = oneshot::channel();
+		ctx.send_message(ChainApiMessage::FinalizedBlockNumber(tx)).await;
+		match rx.await? {
+			Ok(number) => Some(number),
+			Err(err) => {
+				gum::warn!(target: LOG_TARGET, ?err, "Failed fetching finalized number");
+				None
+			},
+		}
+	};
 
 	loop {
 		let mut overlayed_db = OverlayedBackend::new(&backend);
@@ -692,6 +735,7 @@ where
 					woken_block,
 					woken_candidate,
 					tick,
+					&subsystem.metrics,
 				)?
 			}
 			next_msg = ctx.recv().fuse() => {
@@ -906,26 +950,14 @@ async fn handle_actions(
 				dispute_statement,
 				validator_index,
 			} => {
-				let (pending_confirmation, confirmation_rx) = oneshot::channel();
 				ctx.send_message(DisputeCoordinatorMessage::ImportStatements {
 					candidate_hash,
 					candidate_receipt,
 					session,
 					statements: vec![(dispute_statement, validator_index)],
-					pending_confirmation,
+					pending_confirmation: None,
 				})
 				.await;
-
-				match confirmation_rx.await {
-					Err(oneshot::Canceled) => {
-						tracing::warn!(target: LOG_TARGET, "Dispute coordinator confirmation lost",)
-					},
-					Ok(ImportStatementsResult::ValidImport) => {},
-					Ok(ImportStatementsResult::InvalidImport) => tracing::warn!(
-						target: LOG_TARGET,
-						"Failed to import statements of validity",
-					),
-				}
 			},
 			Action::NoteApprovedInChainSelection(block_hash) => {
 				ctx.send_message(ChainSelectionMessage::Approved(block_hash)).await;
@@ -960,7 +992,7 @@ fn distribution_messages_for_activation(
 		let block_entry = match db.load_block_entry(&block_hash)? {
 			Some(b) => b,
 			None => {
-				tracing::warn!(target: LOG_TARGET, ?block_hash, "Missing block entry");
+				gum::warn!(target: LOG_TARGET, ?block_hash, "Missing block entry");
 
 				continue
 			},
@@ -971,13 +1003,14 @@ fn distribution_messages_for_activation(
 			parent_hash: block_entry.parent_hash(),
 			candidates: block_entry.candidates().iter().map(|(_, c_hash)| *c_hash).collect(),
 			slot: block_entry.slot(),
+			session: block_entry.session(),
 		});
 
 		for (i, (_, candidate_hash)) in block_entry.candidates().iter().enumerate() {
 			let candidate_entry = match db.load_candidate_entry(&candidate_hash)? {
 				Some(c) => c,
 				None => {
-					tracing::warn!(
+					gum::warn!(
 						target: LOG_TARGET,
 						?block_hash,
 						?candidate_hash,
@@ -1024,7 +1057,7 @@ fn distribution_messages_for_activation(
 					}
 				},
 				None => {
-					tracing::warn!(
+					gum::warn!(
 						target: LOG_TARGET,
 						?block_hash,
 						?candidate_hash,
@@ -1061,8 +1094,9 @@ async fn handle_from_overseer(
 					Ok(block_imported_candidates) => {
 						// Schedule wakeups for all imported candidates.
 						for block_batch in block_imported_candidates {
-							tracing::debug!(
+							gum::debug!(
 								target: LOG_TARGET,
+								block_number = ?block_batch.block_number,
 								block_hash = ?block_batch.block_hash,
 								num_candidates = block_batch.imported_candidates.len(),
 								"Imported new block.",
@@ -1077,7 +1111,7 @@ async fn handle_from_overseer(
 
 								if let Some(our_tranche) = our_tranche {
 									let tick = our_tranche as Tick + block_batch.block_tick;
-									tracing::trace!(
+									gum::trace!(
 										target: LOG_TARGET,
 										tranche = our_tranche,
 										candidate_hash = ?c_hash,
@@ -1105,6 +1139,7 @@ async fn handle_from_overseer(
 			actions
 		},
 		FromOverseer::Signal(OverseerSignal::BlockFinalized(block_hash, block_number)) => {
+			gum::debug!(target: LOG_TARGET, ?block_hash, ?block_number, "Block finalized");
 			*last_finalized_height = Some(block_number);
 
 			crate::ops::canonicalize(db, block_number, block_hash)
@@ -1208,21 +1243,24 @@ async fn handle_approved_ancestor(
 
 	let mut block_descriptions = Vec::new();
 
-	let mut bits: BitVec<Lsb0, u8> = Default::default();
+	let mut bits: BitVec<u8, Lsb0> = Default::default();
 	for (i, block_hash) in std::iter::once(target).chain(ancestry).enumerate() {
 		// Block entries should be present as the assumption is that
 		// nothing here is finalized. If we encounter any missing block
 		// entries we can fail.
 		let entry = match db.load_block_entry(&block_hash)? {
 			None => {
-				tracing::trace! {
+				let block_number = target_number.saturating_sub(i as u32);
+				gum::info!(
 					target: LOG_TARGET,
+					unknown_number = ?block_number,
+					unknown_hash = ?block_hash,
 					"Chain between ({}, {}) and {} not fully known. Forcing vote on {}",
 					target,
 					target_number,
 					lower_bound,
 					lower_bound,
-				}
+				);
 				return Ok(None)
 			},
 			Some(b) => b,
@@ -1237,6 +1275,15 @@ async fn handle_approved_ancestor(
 				// ancestry is moving backwards.
 				all_approved_max = Some((block_hash, target_number - i as BlockNumber));
 			}
+			block_descriptions.push(BlockDescription {
+				block_hash,
+				session: entry.session(),
+				candidates: entry
+					.candidates()
+					.iter()
+					.map(|(_idx, candidate_hash)| *candidate_hash)
+					.collect(),
+			});
 		} else if bits.len() <= ABNORMAL_DEPTH_THRESHOLD {
 			all_approved_max = None;
 			block_descriptions.clear();
@@ -1245,7 +1292,7 @@ async fn handle_approved_ancestor(
 			block_descriptions.clear();
 
 			let unapproved: Vec<_> = entry.unapproved_candidates().collect();
-			tracing::debug!(
+			gum::debug!(
 				target: LOG_TARGET,
 				"Block {} is {} blocks deep and has {}/{} candidates unapproved",
 				block_hash,
@@ -1257,7 +1304,7 @@ async fn handle_approved_ancestor(
 			for candidate_hash in unapproved {
 				match db.load_candidate_entry(&candidate_hash)? {
 					None => {
-						tracing::warn!(
+						gum::warn!(
 							target: LOG_TARGET,
 							?candidate_hash,
 							"Missing expected candidate in DB",
@@ -1267,7 +1314,7 @@ async fn handle_approved_ancestor(
 					},
 					Some(c_entry) => match c_entry.approval_entry(&block_hash) {
 						None => {
-							tracing::warn!(
+							gum::warn!(
 								target: LOG_TARGET,
 								?candidate_hash,
 								?block_hash,
@@ -1275,10 +1322,21 @@ async fn handle_approved_ancestor(
 							);
 						},
 						Some(a_entry) => {
-							let n_assignments = a_entry.n_assignments();
-							let n_approvals = c_entry.approvals().count_ones();
-
 							let status = || {
+								let n_assignments = a_entry.n_assignments();
+
+								// Take the approvals, filtered by the assignments
+								// for this block.
+								let n_approvals = c_entry
+									.approvals()
+									.iter()
+									.by_vals()
+									.enumerate()
+									.filter(|(i, approved)| {
+										*approved && a_entry.is_assigned(ValidatorIndex(*i as _))
+									})
+									.count();
+
 								format!(
 									"{}/{}/{}",
 									n_assignments,
@@ -1288,7 +1346,7 @@ async fn handle_approved_ancestor(
 							};
 
 							match a_entry.our_assignment() {
-								None => tracing::debug!(
+								None => gum::debug!(
 									target: LOG_TARGET,
 									?candidate_hash,
 									?block_hash,
@@ -1302,7 +1360,10 @@ async fn handle_approved_ancestor(
 									let next_wakeup =
 										wakeups.wakeup_for(block_hash, candidate_hash);
 
-									tracing::debug!(
+									let approved =
+										triggered && { a_entry.local_statements().1.is_some() };
+
+									gum::debug!(
 										target: LOG_TARGET,
 										?candidate_hash,
 										?block_hash,
@@ -1310,6 +1371,7 @@ async fn handle_approved_ancestor(
 										?next_wakeup,
 										status = %status(),
 										triggered,
+										approved,
 										"assigned."
 									);
 								},
@@ -1319,18 +1381,9 @@ async fn handle_approved_ancestor(
 				}
 			}
 		}
-		block_descriptions.push(BlockDescription {
-			block_hash,
-			session: entry.session(),
-			candidates: entry
-				.candidates()
-				.iter()
-				.map(|(_idx, candidate_hash)| *candidate_hash)
-				.collect(),
-		});
 	}
 
-	tracing::trace!(
+	gum::debug!(
 		target: LOG_TARGET,
 		"approved blocks {}-[{}]-{}",
 		target_number,
@@ -1396,13 +1449,21 @@ fn schedule_wakeup_action(
 	block_number: BlockNumber,
 	candidate_hash: CandidateHash,
 	block_tick: Tick,
+	tick_now: Tick,
 	required_tranches: RequiredTranches,
 ) -> Option<Action> {
 	let maybe_action = match required_tranches {
 		_ if approval_entry.is_approved() => None,
 		RequiredTranches::All => None,
-		RequiredTranches::Exact { next_no_show, .. } => next_no_show
-			.map(|tick| Action::ScheduleWakeup { block_hash, block_number, candidate_hash, tick }),
+		RequiredTranches::Exact { next_no_show, last_assignment_tick, .. } => {
+			// Take the earlier of the next no show or the last assignment tick + required delay,
+			// only considering the latter if it is after the current moment.
+			min_prefer_some(
+				last_assignment_tick.map(|l| l + APPROVAL_DELAY).filter(|t| t > &tick_now),
+				next_no_show,
+			)
+			.map(|tick| Action::ScheduleWakeup { block_hash, block_number, candidate_hash, tick })
+		},
 		RequiredTranches::Pending { considered, next_no_show, clock_drift, .. } => {
 			// select the minimum of `next_no_show`, or the tick of the next non-empty tranche
 			// after `considered`, including any tranche that might contain our own untriggered
@@ -1435,7 +1496,7 @@ fn schedule_wakeup_action(
 	};
 
 	match maybe_action {
-		Some(Action::ScheduleWakeup { ref tick, .. }) => tracing::trace!(
+		Some(Action::ScheduleWakeup { ref tick, .. }) => gum::trace!(
 			target: LOG_TARGET,
 			tick,
 			?candidate_hash,
@@ -1443,7 +1504,7 @@ fn schedule_wakeup_action(
 			block_tick,
 			"Scheduling next wakeup.",
 		),
-		None => tracing::trace!(
+		None => gum::trace!(
 			target: LOG_TARGET,
 			?candidate_hash,
 			?block_hash,
@@ -1534,10 +1595,11 @@ fn check_and_import_assignment(
 		);
 
 		let tranche = match res {
-			Err(crate::criteria::InvalidAssignment) =>
+			Err(crate::criteria::InvalidAssignment(reason)) =>
 				return Ok((
 					AssignmentCheckResult::Bad(AssignmentCheckError::InvalidCert(
 						assignment.validator,
+						format!("{:?}", reason),
 					)),
 					Vec::new(),
 				)),
@@ -1561,7 +1623,7 @@ fn check_and_import_assignment(
 		if is_duplicate {
 			AssignmentCheckResult::AcceptedDuplicate
 		} else {
-			tracing::trace!(
+			gum::trace!(
 				target: LOG_TARGET,
 				validator = assignment.validator.0,
 				candidate_hash = ?assigned_candidate_hash,
@@ -1583,6 +1645,7 @@ fn check_and_import_assignment(
 			block_entry.block_number(),
 			assigned_candidate_hash,
 			status.block_tick,
+			tick_now,
 			status.required_tranches,
 		));
 	}
@@ -1683,7 +1746,7 @@ fn check_and_import_approval<T>(
 	// importing the approval can be heavy as it may trigger acceptance for a series of blocks.
 	let t = with_response(ApprovalCheckResult::Accepted);
 
-	tracing::trace!(
+	gum::trace!(
 		target: LOG_TARGET,
 		validator_index = approval.validator.0,
 		validator = ?pubkey,
@@ -1708,14 +1771,14 @@ fn check_and_import_approval<T>(
 		None
 	};
 
-	let mut actions = import_checked_approval(
+	let mut actions = advance_approval_state(
 		state,
 		db,
 		&metrics,
 		block_entry,
 		approved_candidate_hash,
 		candidate_entry,
-		ApprovalSource::Remote(approval.validator),
+		ApprovalStateTransition::RemoteApproval(approval.validator),
 	);
 
 	actions.extend(inform_disputes_action);
@@ -1723,41 +1786,46 @@ fn check_and_import_approval<T>(
 	Ok((actions, t))
 }
 
-enum ApprovalSource {
-	Remote(ValidatorIndex),
-	Local(ValidatorIndex, ValidatorSignature),
+#[derive(Debug)]
+enum ApprovalStateTransition {
+	RemoteApproval(ValidatorIndex),
+	LocalApproval(ValidatorIndex, ValidatorSignature),
+	WakeupProcessed,
 }
 
-impl ApprovalSource {
-	fn validator_index(&self) -> ValidatorIndex {
+impl ApprovalStateTransition {
+	fn validator_index(&self) -> Option<ValidatorIndex> {
 		match *self {
-			ApprovalSource::Remote(v) | ApprovalSource::Local(v, _) => v,
+			ApprovalStateTransition::RemoteApproval(v) |
+			ApprovalStateTransition::LocalApproval(v, _) => Some(v),
+			ApprovalStateTransition::WakeupProcessed => None,
 		}
 	}
 
-	fn is_remote(&self) -> bool {
+	fn is_local_approval(&self) -> bool {
 		match *self {
-			ApprovalSource::Remote(_) => true,
-			ApprovalSource::Local(_, _) => false,
+			ApprovalStateTransition::RemoteApproval(_) => false,
+			ApprovalStateTransition::LocalApproval(_, _) => true,
+			ApprovalStateTransition::WakeupProcessed => false,
 		}
 	}
 }
 
-// Import an approval vote which is already checked to be valid and corresponding to an assigned
-// validator on the candidate and block. This updates the block entry and candidate entry as
+// Advance the approval state, either by importing an approval vote which is already checked to be valid and corresponding to an assigned
+// validator on the candidate and block, or by noting that there are no further wakeups or tranches needed. This updates the block entry and candidate entry as
 // necessary and schedules any further wakeups.
-fn import_checked_approval(
+fn advance_approval_state(
 	state: &State,
 	db: &mut OverlayedBackend<'_, impl Backend>,
 	metrics: &Metrics,
 	mut block_entry: BlockEntry,
 	candidate_hash: CandidateHash,
 	mut candidate_entry: CandidateEntry,
-	source: ApprovalSource,
+	transition: ApprovalStateTransition,
 ) -> Vec<Action> {
-	let validator_index = source.validator_index();
+	let validator_index = transition.validator_index();
 
-	let already_approved_by = candidate_entry.mark_approval(validator_index);
+	let already_approved_by = validator_index.as_ref().map(|v| candidate_entry.mark_approval(*v));
 	let candidate_approved_in_block = block_entry.is_candidate_approved(&candidate_hash);
 
 	// Check for early exits.
@@ -1769,22 +1837,20 @@ fn import_checked_approval(
 	// If the block was approved, but the validator hadn't approved it yet, we should still hold
 	// onto the approval vote on-disk in case we restart and rebroadcast votes. Otherwise, our
 	// assignment might manifest as a no-show.
-	match source {
-		ApprovalSource::Remote(_) => {
-			// We don't store remote votes, so we can early exit as long at the candidate is
-			// already concluded under the block i.e. we don't need more approvals.
-			if candidate_approved_in_block {
-				return Vec::new()
-			}
-		},
-		ApprovalSource::Local(_, _) => {
-			// We never early return on the local validator.
-		},
+	if !transition.is_local_approval() {
+		// We don't store remote votes and there's nothing to store for processed wakeups,
+		// so we can early exit as long at the candidate is already concluded under the
+		// block i.e. we don't need more approvals.
+		if candidate_approved_in_block {
+			return Vec::new()
+		}
 	}
 
 	let mut actions = Vec::new();
 	let block_hash = block_entry.block_hash();
 	let block_number = block_entry.block_number();
+
+	let tick_now = state.clock.tick_now();
 
 	let (is_approved, status) = if let Some((approval_entry, status)) =
 		state.approval_status(&block_entry, &candidate_entry)
@@ -1795,10 +1861,13 @@ fn import_checked_approval(
 			status.required_tranches.clone(),
 		);
 
-		let is_approved = check.is_approved();
+		// Check whether this is approved, while allowing a maximum
+		// assignment tick of `now - APPROVAL_DELAY` - that is, that
+		// all counted assignments are at least `APPROVAL_DELAY` ticks old.
+		let is_approved = check.is_approved(tick_now.saturating_sub(APPROVAL_DELAY));
 
 		if is_approved {
-			tracing::trace!(
+			gum::trace!(
 				target: LOG_TARGET,
 				?candidate_hash,
 				?block_hash,
@@ -1827,7 +1896,7 @@ fn import_checked_approval(
 
 		(is_approved, status)
 	} else {
-		tracing::warn!(
+		gum::warn!(
 			target: LOG_TARGET,
 			?candidate_hash,
 			?block_hash,
@@ -1850,7 +1919,7 @@ fn import_checked_approval(
 			approval_entry.mark_approved();
 		}
 
-		if let ApprovalSource::Local(_, ref sig) = source {
+		if let ApprovalStateTransition::LocalApproval(_, ref sig) = transition {
 			approval_entry.import_approval_sig(sig.clone());
 		}
 
@@ -1860,16 +1929,19 @@ fn import_checked_approval(
 			block_number,
 			candidate_hash,
 			status.block_tick,
+			tick_now,
 			status.required_tranches,
 		));
 
-		// We have no need to write the candidate entry if
+		// We have no need to write the candidate entry if all of the following
+		// is true:
 		//
-		// 1. The source is remote, as we don't store anything new in the approval entry.
+		// 1. This is not a local approval, as we don't store anything new in the approval entry.
 		// 2. The candidate is not newly approved, as we haven't altered the approval entry's
 		//	  approved flag with `mark_approved` above.
-		// 3. The source had already approved the candidate, as we haven't altered the bitfield.
-		if !source.is_remote() || newly_approved || !already_approved_by {
+		// 3. The approver, if any, had already approved the candidate, as we haven't altered the bitfield.
+		if transition.is_local_approval() || newly_approved || !already_approved_by.unwrap_or(true)
+		{
 			// In all other cases, we need to write the candidate entry.
 			db.write_candidate_entry(candidate_entry);
 		}
@@ -1887,6 +1959,7 @@ fn should_trigger_assignment(
 	match approval_entry.our_assignment() {
 		None => false,
 		Some(ref assignment) if assignment.triggered() => false,
+		Some(ref assignment) if assignment.tranche() == 0 => true,
 		Some(ref assignment) => {
 			match required_tranches {
 				RequiredTranches::All => !approval_checking::check_approval(
@@ -1894,7 +1967,7 @@ fn should_trigger_assignment(
 					&approval_entry,
 					RequiredTranches::All,
 				)
-				.is_approved(),
+				.is_approved(Tick::max_value()), // when all are required, we are just waiting for the first 1/3+
 				RequiredTranches::Pending { maximum_broadcast, clock_drift, .. } => {
 					let drifted_tranche_now =
 						tranche_now.saturating_sub(clock_drift as DelayTranche);
@@ -1916,6 +1989,7 @@ fn process_wakeup(
 	relay_block: Hash,
 	candidate_hash: CandidateHash,
 	expected_tick: Tick,
+	metrics: &Metrics,
 ) -> SubsystemResult<Vec<Action>> {
 	let _span = jaeger::Span::from_encodable(
 		(relay_block, candidate_hash, expected_tick),
@@ -1937,7 +2011,7 @@ fn process_wakeup(
 	let session_info = match state.session_info(block_entry.session()) {
 		Some(i) => i,
 		None => {
-			tracing::warn!(
+			gum::warn!(
 				target: LOG_TARGET,
 				"Missing session info for live block {} in session {}",
 				relay_block,
@@ -1956,7 +2030,7 @@ fn process_wakeup(
 
 	let tranche_now = state.clock.tranche_now(state.slot_duration_millis, block_entry.slot());
 
-	tracing::trace!(
+	gum::trace!(
 		target: LOG_TARGET,
 		tranche = tranche_now,
 		?candidate_hash,
@@ -2016,7 +2090,7 @@ fn process_wakeup(
 			block_entry.candidates().iter().position(|(_, h)| &candidate_hash == h);
 
 		if let Some(i) = index_in_candidate {
-			tracing::trace!(
+			gum::trace!(
 				target: LOG_TARGET,
 				?candidate_hash,
 				para_id = ?candidate_receipt.descriptor.para_id,
@@ -2038,28 +2112,20 @@ fn process_wakeup(
 		}
 	}
 
-	let approval_entry = candidate_entry
-		.approval_entry(&relay_block)
-		.expect("this function returned earlier if not available; qed");
-
-	// Although we ran this earlier in the function, we need to run again because we might have
-	// imported our own assignment, which could change things.
-	let tranches_to_approve = approval_checking::tranches_to_approve(
-		&approval_entry,
-		candidate_entry.approvals(),
-		tranche_now,
-		block_tick,
-		no_show_duration,
-		session_info.needed_approvals as _,
-	);
-
-	actions.extend(schedule_wakeup_action(
-		&approval_entry,
-		relay_block,
-		block_entry.block_number(),
+	// Although we checked approval earlier in this function,
+	// this wakeup might have advanced the state to approved via
+	// a no-show that was immediately covered and therefore
+	// we need to check for that and advance the state on-disk.
+	//
+	// Note that this function also schedules a wakeup as necessary.
+	actions.extend(advance_approval_state(
+		state,
+		db,
+		metrics,
+		block_entry,
 		candidate_hash,
-		block_tick,
-		tranches_to_approve,
+		candidate_entry,
+		ApprovalStateTransition::WakeupProcessed,
 	));
 
 	Ok(actions)
@@ -2109,7 +2175,7 @@ async fn launch_approval(
 	let candidate_hash = candidate.hash();
 	let para_id = candidate.descriptor.para_id;
 
-	tracing::trace!(target: LOG_TARGET, ?candidate_hash, ?para_id, "Recovering data.");
+	gum::trace!(target: LOG_TARGET, ?candidate_hash, ?para_id, "Recovering data.");
 
 	let timer = metrics.time_recover_and_approve();
 	ctx.send_message(AvailabilityRecoveryMessage::RecoverAvailableData(
@@ -2143,7 +2209,7 @@ async fn launch_approval(
 			Ok(Err(e)) => {
 				match &e {
 					&RecoveryError::Unavailable => {
-						tracing::warn!(
+						gum::warn!(
 							target: LOG_TARGET,
 							?para_id,
 							?candidate_hash,
@@ -2154,7 +2220,7 @@ async fn launch_approval(
 						metrics_guard.take().on_approval_unavailable();
 					},
 					&RecoveryError::Invalid => {
-						tracing::warn!(
+						gum::warn!(
 							target: LOG_TARGET,
 							?para_id,
 							?candidate_hash,
@@ -2185,7 +2251,7 @@ async fn launch_approval(
 			Ok(Err(_)) => return ApprovalState::failed(validator_index, candidate_hash),
 			Ok(Ok(Some(code))) => code,
 			Ok(Ok(None)) => {
-				tracing::warn!(
+				gum::warn!(
 					target: LOG_TARGET,
 					"Validation code unavailable for block {:?} in the state of block {:?} (a recent descendant)",
 					candidate.descriptor.relay_parent,
@@ -2206,8 +2272,9 @@ async fn launch_approval(
 				CandidateValidationMessage::ValidateFromExhaustive(
 					available_data.validation_data,
 					validation_code,
-					candidate.descriptor.clone(),
+					candidate.clone(),
 					available_data.pov,
+					APPROVAL_EXECUTION_TIMEOUT,
 					val_tx,
 				)
 				.into(),
@@ -2220,7 +2287,7 @@ async fn launch_approval(
 				// Validation checked out. Issue an approval command. If the underlying service is unreachable,
 				// then there isn't anything we can do.
 
-				tracing::trace!(target: LOG_TARGET, ?candidate_hash, ?para_id, "Candidate Valid");
+				gum::trace!(target: LOG_TARGET, ?candidate_hash, ?para_id, "Candidate Valid");
 
 				let expected_commitments_hash = candidate.commitments_hash;
 				if commitments.hash() == expected_commitments_hash {
@@ -2245,7 +2312,7 @@ async fn launch_approval(
 				}
 			},
 			Ok(Ok(ValidationResult::Invalid(reason))) => {
-				tracing::warn!(
+				gum::warn!(
 					target: LOG_TARGET,
 					?reason,
 					?candidate_hash,
@@ -2269,7 +2336,7 @@ async fn launch_approval(
 				return ApprovalState::failed(validator_index, candidate_hash)
 			},
 			Ok(Err(e)) => {
-				tracing::error!(
+				gum::error!(
 					target: LOG_TARGET,
 					err = ?e,
 					?candidate_hash,
@@ -2308,7 +2375,7 @@ async fn issue_approval(
 	let candidate_index = match block_entry.candidates().iter().position(|e| e.1 == candidate_hash)
 	{
 		None => {
-			tracing::warn!(
+			gum::warn!(
 				target: LOG_TARGET,
 				"Candidate hash {} is not present in the block entry's candidates for relay block {}",
 				candidate_hash,
@@ -2324,7 +2391,7 @@ async fn issue_approval(
 	let session_info = match state.session_info(block_entry.session()) {
 		Some(s) => s,
 		None => {
-			tracing::warn!(
+			gum::warn!(
 				target: LOG_TARGET,
 				"Missing session info for live block {} in session {}",
 				block_hash,
@@ -2339,7 +2406,7 @@ async fn issue_approval(
 	let candidate_hash = match block_entry.candidate(candidate_index as usize) {
 		Some((_, h)) => h.clone(),
 		None => {
-			tracing::warn!(
+			gum::warn!(
 				target: LOG_TARGET,
 				"Received malformed request to approve out-of-bounds candidate index {} included at block {:?}",
 				candidate_index,
@@ -2354,7 +2421,7 @@ async fn issue_approval(
 	let candidate_entry = match db.load_candidate_entry(&candidate_hash)? {
 		Some(c) => c,
 		None => {
-			tracing::warn!(
+			gum::warn!(
 				target: LOG_TARGET,
 				"Missing entry for candidate index {} included at block {:?}",
 				candidate_index,
@@ -2369,7 +2436,7 @@ async fn issue_approval(
 	let validator_pubkey = match session_info.validators.get(validator_index.0 as usize) {
 		Some(p) => p,
 		None => {
-			tracing::warn!(
+			gum::warn!(
 				target: LOG_TARGET,
 				"Validator index {} out of bounds in session {}",
 				validator_index.0,
@@ -2385,7 +2452,7 @@ async fn issue_approval(
 	let sig = match sign_approval(&state.keystore, &validator_pubkey, candidate_hash, session) {
 		Some(sig) => sig,
 		None => {
-			tracing::warn!(
+			gum::warn!(
 				target: LOG_TARGET,
 				validator_index = ?validator_index,
 				session,
@@ -2408,7 +2475,7 @@ async fn issue_approval(
 	)
 	.expect("Statement just signed; should pass checks; qed");
 
-	tracing::debug!(
+	gum::trace!(
 		target: LOG_TARGET,
 		?candidate_hash,
 		?block_hash,
@@ -2434,14 +2501,14 @@ async fn issue_approval(
 		None
 	};
 
-	let mut actions = import_checked_approval(
+	let mut actions = advance_approval_state(
 		state,
 		db,
 		metrics,
 		block_entry,
 		candidate_hash,
 		candidate_entry,
-		ApprovalSource::Local(validator_index as _, sig.clone()),
+		ApprovalStateTransition::LocalApproval(validator_index as _, sig.clone()),
 	);
 
 	metrics.on_approval_produced();

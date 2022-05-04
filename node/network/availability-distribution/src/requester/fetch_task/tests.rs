@@ -29,8 +29,8 @@ use sc_network as network;
 use sp_keyring::Sr25519Keyring;
 
 use polkadot_node_network_protocol::request_response::{v1, Recipient};
-use polkadot_node_primitives::{BlockData, PoV};
-use polkadot_primitives::v1::{CandidateHash, ValidatorIndex};
+use polkadot_node_primitives::{BlockData, PoV, Proof};
+use polkadot_primitives::v2::{CandidateHash, ValidatorIndex};
 
 use super::*;
 use crate::{metrics::Metrics, tests::mock::get_valid_chunk_data};
@@ -60,7 +60,7 @@ fn task_does_not_accept_invalid_chunk() {
 				Recipient::Authority(Sr25519Keyring::Alice.public().into()),
 				ChunkFetchingResponse::Chunk(v1::ChunkResponse {
 					chunk: vec![1, 2, 3],
-					proof: vec![vec![9, 8, 2], vec![2, 3, 4]],
+					proof: Proof::try_from(vec![vec![9, 8, 2], vec![2, 3, 4]]).unwrap(),
 				}),
 			);
 			m
@@ -170,7 +170,7 @@ fn task_stores_valid_chunk_if_there_is_one() {
 				Recipient::Authority(Sr25519Keyring::Charlie.public().into()),
 				ChunkFetchingResponse::Chunk(v1::ChunkResponse {
 					chunk: vec![1, 2, 3],
-					proof: vec![vec![9, 8, 2], vec![2, 3, 4]],
+					proof: Proof::try_from(vec![vec![9, 8, 2], vec![2, 3, 4]]).unwrap(),
 				}),
 			);
 
@@ -230,12 +230,12 @@ impl TestRun {
 		match msg {
 			AllMessages::NetworkBridge(NetworkBridgeMessage::SendRequests(
 				reqs,
-				IfDisconnected::TryConnect,
+				IfDisconnected::ImmediateError,
 			)) => {
 				let mut valid_responses = 0;
 				for req in reqs {
 					let req = match req {
-						Requests::ChunkFetching(req) => req,
+						Requests::ChunkFetchingV1(req) => req,
 						_ => panic!("Unexpected request"),
 					};
 					let response =
@@ -262,7 +262,7 @@ impl TestRun {
 				return true
 			},
 			_ => {
-				tracing::debug!(target: LOG_TARGET, "Unexpected message");
+				gum::debug!(target: LOG_TARGET, "Unexpected message");
 				return false
 			},
 		}

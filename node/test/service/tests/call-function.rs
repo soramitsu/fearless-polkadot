@@ -15,17 +15,19 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use polkadot_test_service::*;
-use service::TaskExecutor;
-use sp_keyring::Sr25519Keyring::{Alice, Bob};
+use sp_keyring::Sr25519Keyring::{Alice, Bob, Charlie};
 
 #[substrate_test_utils::test]
-async fn call_function_actually_work(task_executor: TaskExecutor) {
-	let alice = run_validator_node(task_executor, Alice, || {}, Vec::new(), None);
+async fn call_function_actually_work() {
+	let alice_config =
+		node_config(|| {}, tokio::runtime::Handle::current(), Alice, Vec::new(), true);
 
-	let function = polkadot_test_runtime::Call::Balances(pallet_balances::Call::transfer(
-		Default::default(),
-		1,
-	));
+	let alice = run_validator_node(alice_config, None);
+
+	let function = polkadot_test_runtime::Call::Balances(pallet_balances::Call::transfer {
+		dest: Charlie.to_account_id().into(),
+		value: 1,
+	});
 	let output = alice.send_extrinsic(function, Bob).await.unwrap();
 
 	let res = output.result.expect("return value expected");
@@ -35,6 +37,4 @@ async fn call_function_actually_work(task_executor: TaskExecutor) {
 	let result = object.get("result");
 	let result = result.expect("key result exists");
 	assert_eq!(result.as_str().map(|x| x.starts_with("0x")), Some(true), "result starts with 0x");
-
-	alice.task_manager.clean_shutdown().await;
 }

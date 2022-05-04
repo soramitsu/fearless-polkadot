@@ -30,7 +30,7 @@ use futures::{
 use futures_timer::Delay;
 
 use sc_network as network;
-use sc_network::{config as netconfig, IfDisconnected};
+use sc_network::{config as netconfig, config::RequestResponseConfig, IfDisconnected};
 use sp_core::{testing::TaskExecutor, traits::SpawnNamed};
 use sp_keystore::SyncCryptoStorePtr;
 
@@ -39,13 +39,13 @@ use polkadot_node_network_protocol::{
 	request_response::{v1, IncomingRequest, OutgoingRequest, Requests},
 };
 use polkadot_node_primitives::ErasureChunk;
-use polkadot_primitives::v1::{
+use polkadot_primitives::v2::{
 	CandidateHash, CoreState, GroupIndex, Hash, Id as ParaId, ScheduledCore, SessionInfo,
 	ValidatorIndex,
 };
 use polkadot_subsystem::{
 	messages::{
-		AllMessages, AvailabilityDistributionMessage, AvailabilityStoreMessage,
+		AllMessages, AvailabilityDistributionMessage, AvailabilityStoreMessage, ChainApiMessage,
 		NetworkBridgeMessage, RuntimeApiMessage, RuntimeApiRequest,
 	},
 	ActivatedLeaf, ActiveLeavesUpdate, FromOverseer, LeafStatus, OverseerSignal,
@@ -59,6 +59,8 @@ use crate::LOG_TARGET;
 type VirtualOverseer = test_helpers::TestSubsystemContextHandle<AvailabilityDistributionMessage>;
 pub struct TestHarness {
 	pub virtual_overseer: VirtualOverseer,
+	pub pov_req_cfg: RequestResponseConfig,
+	pub chunk_req_cfg: RequestResponseConfig,
 	pub pool: TaskExecutor,
 }
 
@@ -152,9 +154,7 @@ impl TestState {
 	/// Run, but fail after some timeout.
 	pub async fn run(self, harness: TestHarness) {
 		// Make sure test won't run forever.
-		let f = self
-			.run_inner(harness.pool, harness.virtual_overseer)
-			.timeout(Duration::from_secs(10));
+		let f = self.run_inner(harness).timeout(Duration::from_secs(10));
 		assert!(f.await.is_some(), "Test ran into timeout");
 	}
 
@@ -166,8 +166,8 @@ impl TestState {
 	///
 	/// We try to be as agnostic about details as possible, how the subsystem achieves those goals
 	/// should not be a matter to this test suite.
-	async fn run_inner(mut self, executor: TaskExecutor, virtual_overseer: VirtualOverseer) {
-		// We skip genesis here (in reality ActiveLeavesUpdate can also skip a block:
+	async fn run_inner(mut self, mut harness: TestHarness) {
+		// We skip genesis here (in reality ActiveLeavesUpdate can also skip a block):
 		let updates = {
 			let mut advanced = self.relay_chain.iter();
 			advanced.next();
@@ -191,44 +191,44 @@ impl TestState {
 		// Test will fail if this does not happen until timeout.
 		let mut remaining_stores = self.valid_chunks.len();
 
-		let TestSubsystemContextHandle { tx, mut rx } = virtual_overseer;
+		let TestSubsystemContextHandle { tx, mut rx } = harness.virtual_overseer;
 
 		// Spawning necessary as incoming queue can only hold a single item, we don't want to dead
 		// lock ;-)
 		let update_tx = tx.clone();
-		executor.spawn(
-			"Sending active leaves updates",
+		harness.pool.spawn(
+			"sending-active-leaves-updates",
+			None,
 			async move {
 				for update in updates {
 					overseer_signal(update_tx.clone(), OverseerSignal::ActiveLeaves(update)).await;
 					// We need to give the subsystem a little time to do its job, otherwise it will
 					// cancel jobs as obsolete:
-					Delay::new(Duration::from_millis(20)).await;
+					Delay::new(Duration::from_millis(100)).await;
 				}
 			}
 			.boxed(),
 		);
 
 		while remaining_stores > 0 {
-			tracing::trace!(target: LOG_TARGET, remaining_stores, "Stores left to go");
+			gum::trace!(target: LOG_TARGET, remaining_stores, "Stores left to go");
 			let msg = overseer_recv(&mut rx).await;
 			match msg {
 				AllMessages::NetworkBridge(NetworkBridgeMessage::SendRequests(
 					reqs,
-					IfDisconnected::TryConnect,
+					IfDisconnected::ImmediateError,
 				)) => {
 					for req in reqs {
 						// Forward requests:
-						let in_req = to_incoming_req(&executor, req);
-
-						executor.spawn(
-							"Request forwarding",
-							overseer_send(
-								tx.clone(),
-								AvailabilityDistributionMessage::ChunkFetchingRequest(in_req),
-							)
-							.boxed(),
-						);
+						let in_req = to_incoming_req(&harness.pool, req);
+						harness
+							.chunk_req_cfg
+							.inbound_queue
+							.as_mut()
+							.unwrap()
+							.send(in_req.into_raw())
+							.await
+							.unwrap();
 					}
 				},
 				AllMessages::AvailabilityStore(AvailabilityStoreMessage::QueryChunk(
@@ -255,7 +255,7 @@ impl TestState {
 						"Only valid chunks should ever get stored."
 					);
 					tx.send(Ok(())).expect("Receiver is expected to be alive");
-					tracing::trace!(target: LOG_TARGET, "'Stored' fetched chunk.");
+					gum::trace!(target: LOG_TARGET, "'Stored' fetched chunk.");
 					remaining_stores -= 1;
 				},
 				AllMessages::RuntimeApi(RuntimeApiMessage::Request(hash, req)) => {
@@ -269,7 +269,7 @@ impl TestState {
 								.expect("Receiver should be alive.");
 						},
 						RuntimeApiRequest::AvailabilityCores(tx) => {
-							tracing::trace!(target: LOG_TARGET, cores= ?self.cores[&hash], hash = ?hash, "Sending out cores for hash");
+							gum::trace!(target: LOG_TARGET, cores= ?self.cores[&hash], hash = ?hash, "Sending out cores for hash");
 							tx.send(Ok(self.cores[&hash].clone()))
 								.expect("Receiver should still be alive");
 						},
@@ -277,6 +277,14 @@ impl TestState {
 							panic!("Unexpected runtime request: {:?}", req);
 						},
 					}
+				},
+				AllMessages::ChainApi(ChainApiMessage::Ancestors { hash, k, response_channel }) => {
+					let chain = &self.relay_chain;
+					let maybe_block_position = chain.iter().position(|h| *h == hash);
+					let ancestors = maybe_block_position
+						.map(|idx| chain[..idx].iter().rev().take(k).copied().collect())
+						.unwrap_or_default();
+					response_channel.send(Ok(ancestors)).expect("Receiver is expected to be alive");
 				},
 				_ => {},
 			}
@@ -291,24 +299,12 @@ async fn overseer_signal(
 	msg: impl Into<OverseerSignal>,
 ) {
 	let msg = msg.into();
-	tracing::trace!(target: LOG_TARGET, msg = ?msg, "sending message");
+	gum::trace!(target: LOG_TARGET, msg = ?msg, "sending message");
 	tx.send(FromOverseer::Signal(msg)).await.expect("Test subsystem no longer live");
 }
 
-async fn overseer_send(
-	mut tx: SingleItemSink<FromOverseer<AvailabilityDistributionMessage>>,
-	msg: impl Into<AvailabilityDistributionMessage>,
-) {
-	let msg = msg.into();
-	tracing::trace!(target: LOG_TARGET, msg = ?msg, "sending message");
-	tx.send(FromOverseer::Communication { msg })
-		.await
-		.expect("Test subsystem no longer live");
-	tracing::trace!(target: LOG_TARGET, "sent message");
-}
-
 async fn overseer_recv(rx: &mut mpsc::UnboundedReceiver<AllMessages>) -> AllMessages {
-	tracing::trace!(target: LOG_TARGET, "waiting for message ...");
+	gum::trace!(target: LOG_TARGET, "waiting for message ...");
 	rx.next().await.expect("Test subsystem no longer live")
 }
 
@@ -317,11 +313,12 @@ fn to_incoming_req(
 	outgoing: Requests,
 ) -> IncomingRequest<v1::ChunkFetchingRequest> {
 	match outgoing {
-		Requests::ChunkFetching(OutgoingRequest { payload, pending_response, .. }) => {
+		Requests::ChunkFetchingV1(OutgoingRequest { payload, pending_response, .. }) => {
 			let (tx, rx): (oneshot::Sender<netconfig::OutgoingResponse>, oneshot::Receiver<_>) =
 				oneshot::channel();
 			executor.spawn(
-				"Message forwarding",
+				"message-forwarding",
+				None,
 				async {
 					let response = rx.await;
 					let payload = response.expect("Unexpected canceled request").result;

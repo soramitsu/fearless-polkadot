@@ -20,11 +20,12 @@ use memory_lru::{MemoryLruCache, ResidentSize};
 use parity_util_mem::{MallocSizeOf, MallocSizeOfExt};
 use sp_consensus_babe::Epoch;
 
-use polkadot_primitives::v1::{
+use polkadot_primitives::v2::{
 	AuthorityDiscoveryId, BlockNumber, CandidateCommitments, CandidateEvent,
 	CommittedCandidateReceipt, CoreState, GroupRotationInfo, Hash, Id as ParaId,
 	InboundDownwardMessage, InboundHrmpMessage, OccupiedCoreAssumption, PersistedValidationData,
-	SessionIndex, SessionInfo, ValidationCode, ValidationCodeHash, ValidatorId, ValidatorIndex,
+	PvfCheckStatement, ScrapedOnChainVotes, SessionIndex, SessionInfo, ValidationCode,
+	ValidationCodeHash, ValidatorId, ValidatorIndex, ValidatorSignature,
 };
 
 const AUTHORITIES_CACHE_SIZE: usize = 128 * 1024;
@@ -32,6 +33,7 @@ const VALIDATORS_CACHE_SIZE: usize = 64 * 1024;
 const VALIDATOR_GROUPS_CACHE_SIZE: usize = 64 * 1024;
 const AVAILABILITY_CORES_CACHE_SIZE: usize = 64 * 1024;
 const PERSISTED_VALIDATION_DATA_CACHE_SIZE: usize = 64 * 1024;
+const ASSUMED_VALIDATION_DATA_CACHE_SIZE: usize = 64 * 1024;
 const CHECK_VALIDATION_OUTPUTS_CACHE_SIZE: usize = 64 * 1024;
 const SESSION_INDEX_FOR_CHILD_CACHE_SIZE: usize = 64 * 1024;
 const VALIDATION_CODE_CACHE_SIZE: usize = 10 * 1024 * 1024;
@@ -41,6 +43,10 @@ const SESSION_INFO_CACHE_SIZE: usize = 64 * 1024;
 const DMQ_CONTENTS_CACHE_SIZE: usize = 64 * 1024;
 const INBOUND_HRMP_CHANNELS_CACHE_SIZE: usize = 64 * 1024;
 const CURRENT_BABE_EPOCH_CACHE_SIZE: usize = 64 * 1024;
+const ON_CHAIN_VOTES_CACHE_SIZE: usize = 3 * 1024;
+const PVFS_REQUIRE_PRECHECK_SIZE: usize = 1024;
+const VALIDATION_CODE_HASH_CACHE_SIZE: usize = 64 * 1024;
+const VERSION_CACHE_SIZE: usize = 4 * 1024;
 
 struct ResidentSizeOf<T>(T);
 
@@ -78,6 +84,10 @@ pub(crate) struct RequestResultCache {
 		(Hash, ParaId, OccupiedCoreAssumption),
 		ResidentSizeOf<Option<PersistedValidationData>>,
 	>,
+	assumed_validation_data: MemoryLruCache<
+		(ParaId, Hash),
+		ResidentSizeOf<Option<(PersistedValidationData, ValidationCodeHash)>>,
+	>,
 	check_validation_outputs:
 		MemoryLruCache<(Hash, ParaId, CandidateCommitments), ResidentSizeOf<bool>>,
 	session_index_for_child: MemoryLruCache<Hash, ResidentSizeOf<SessionIndex>>,
@@ -90,7 +100,7 @@ pub(crate) struct RequestResultCache {
 	candidate_pending_availability:
 		MemoryLruCache<(Hash, ParaId), ResidentSizeOf<Option<CommittedCandidateReceipt>>>,
 	candidate_events: MemoryLruCache<Hash, ResidentSizeOf<Vec<CandidateEvent>>>,
-	session_info: MemoryLruCache<SessionIndex, ResidentSizeOf<Option<SessionInfo>>>,
+	session_info: MemoryLruCache<SessionIndex, ResidentSizeOf<SessionInfo>>,
 	dmq_contents:
 		MemoryLruCache<(Hash, ParaId), ResidentSizeOf<Vec<InboundDownwardMessage<BlockNumber>>>>,
 	inbound_hrmp_channels_contents: MemoryLruCache<
@@ -98,6 +108,13 @@ pub(crate) struct RequestResultCache {
 		ResidentSizeOf<BTreeMap<ParaId, Vec<InboundHrmpMessage<BlockNumber>>>>,
 	>,
 	current_babe_epoch: MemoryLruCache<Hash, DoesNotAllocate<Epoch>>,
+	on_chain_votes: MemoryLruCache<Hash, ResidentSizeOf<Option<ScrapedOnChainVotes>>>,
+	pvfs_require_precheck: MemoryLruCache<Hash, ResidentSizeOf<Vec<ValidationCodeHash>>>,
+	validation_code_hash: MemoryLruCache<
+		(Hash, ParaId, OccupiedCoreAssumption),
+		ResidentSizeOf<Option<ValidationCodeHash>>,
+	>,
+	version: MemoryLruCache<Hash, ResidentSizeOf<u32>>,
 }
 
 impl Default for RequestResultCache {
@@ -108,6 +125,7 @@ impl Default for RequestResultCache {
 			validator_groups: MemoryLruCache::new(VALIDATOR_GROUPS_CACHE_SIZE),
 			availability_cores: MemoryLruCache::new(AVAILABILITY_CORES_CACHE_SIZE),
 			persisted_validation_data: MemoryLruCache::new(PERSISTED_VALIDATION_DATA_CACHE_SIZE),
+			assumed_validation_data: MemoryLruCache::new(ASSUMED_VALIDATION_DATA_CACHE_SIZE),
 			check_validation_outputs: MemoryLruCache::new(CHECK_VALIDATION_OUTPUTS_CACHE_SIZE),
 			session_index_for_child: MemoryLruCache::new(SESSION_INDEX_FOR_CHILD_CACHE_SIZE),
 			validation_code: MemoryLruCache::new(VALIDATION_CODE_CACHE_SIZE),
@@ -120,6 +138,10 @@ impl Default for RequestResultCache {
 			dmq_contents: MemoryLruCache::new(DMQ_CONTENTS_CACHE_SIZE),
 			inbound_hrmp_channels_contents: MemoryLruCache::new(INBOUND_HRMP_CHANNELS_CACHE_SIZE),
 			current_babe_epoch: MemoryLruCache::new(CURRENT_BABE_EPOCH_CACHE_SIZE),
+			on_chain_votes: MemoryLruCache::new(ON_CHAIN_VOTES_CACHE_SIZE),
+			pvfs_require_precheck: MemoryLruCache::new(PVFS_REQUIRE_PRECHECK_SIZE),
+			validation_code_hash: MemoryLruCache::new(VALIDATION_CODE_HASH_CACHE_SIZE),
+			version: MemoryLruCache::new(VERSION_CACHE_SIZE),
 		}
 	}
 }
@@ -184,6 +206,21 @@ impl RequestResultCache {
 		data: Option<PersistedValidationData>,
 	) {
 		self.persisted_validation_data.insert(key, ResidentSizeOf(data));
+	}
+
+	pub(crate) fn assumed_validation_data(
+		&mut self,
+		key: (Hash, ParaId, Hash),
+	) -> Option<&Option<(PersistedValidationData, ValidationCodeHash)>> {
+		self.assumed_validation_data.get(&(key.1, key.2)).map(|v| &v.0)
+	}
+
+	pub(crate) fn cache_assumed_validation_data(
+		&mut self,
+		key: (ParaId, Hash),
+		data: Option<(PersistedValidationData, ValidationCodeHash)>,
+	) {
+		self.assumed_validation_data.insert(key, ResidentSizeOf(data));
 	}
 
 	pub(crate) fn check_validation_outputs(
@@ -272,14 +309,11 @@ impl RequestResultCache {
 		self.candidate_events.insert(relay_parent, ResidentSizeOf(events));
 	}
 
-	pub(crate) fn session_info(
-		&mut self,
-		key: (Hash, SessionIndex),
-	) -> Option<&Option<SessionInfo>> {
-		self.session_info.get(&key.1).map(|v| &v.0)
+	pub(crate) fn session_info(&mut self, key: SessionIndex) -> Option<&SessionInfo> {
+		self.session_info.get(&key).map(|v| &v.0)
 	}
 
-	pub(crate) fn cache_session_info(&mut self, key: SessionIndex, value: Option<SessionInfo>) {
+	pub(crate) fn cache_session_info(&mut self, key: SessionIndex, value: SessionInfo) {
 		self.session_info.insert(key, ResidentSizeOf(value));
 	}
 
@@ -320,14 +354,74 @@ impl RequestResultCache {
 	pub(crate) fn cache_current_babe_epoch(&mut self, relay_parent: Hash, epoch: Epoch) {
 		self.current_babe_epoch.insert(relay_parent, DoesNotAllocate(epoch));
 	}
+
+	pub(crate) fn on_chain_votes(
+		&mut self,
+		relay_parent: &Hash,
+	) -> Option<&Option<ScrapedOnChainVotes>> {
+		self.on_chain_votes.get(relay_parent).map(|v| &v.0)
+	}
+
+	pub(crate) fn cache_on_chain_votes(
+		&mut self,
+		relay_parent: Hash,
+		scraped: Option<ScrapedOnChainVotes>,
+	) {
+		self.on_chain_votes.insert(relay_parent, ResidentSizeOf(scraped));
+	}
+
+	pub(crate) fn pvfs_require_precheck(
+		&mut self,
+		relay_parent: &Hash,
+	) -> Option<&Vec<ValidationCodeHash>> {
+		self.pvfs_require_precheck.get(relay_parent).map(|v| &v.0)
+	}
+
+	pub(crate) fn cache_pvfs_require_precheck(
+		&mut self,
+		relay_parent: Hash,
+		pvfs: Vec<ValidationCodeHash>,
+	) {
+		self.pvfs_require_precheck.insert(relay_parent, ResidentSizeOf(pvfs))
+	}
+
+	pub(crate) fn validation_code_hash(
+		&mut self,
+		key: (Hash, ParaId, OccupiedCoreAssumption),
+	) -> Option<&Option<ValidationCodeHash>> {
+		self.validation_code_hash.get(&key).map(|v| &v.0)
+	}
+
+	pub(crate) fn cache_validation_code_hash(
+		&mut self,
+		key: (Hash, ParaId, OccupiedCoreAssumption),
+		value: Option<ValidationCodeHash>,
+	) {
+		self.validation_code_hash.insert(key, ResidentSizeOf(value));
+	}
+
+	pub(crate) fn version(&mut self, relay_parent: &Hash) -> Option<&u32> {
+		self.version.get(&relay_parent).map(|v| &v.0)
+	}
+
+	pub(crate) fn cache_version(&mut self, key: Hash, value: u32) {
+		self.version.insert(key, ResidentSizeOf(value));
+	}
 }
 
 pub(crate) enum RequestResult {
+	// The structure of each variant is (relay_parent, [params,]*, result)
 	Authorities(Hash, Vec<AuthorityDiscoveryId>),
 	Validators(Hash, Vec<ValidatorId>),
 	ValidatorGroups(Hash, (Vec<Vec<ValidatorIndex>>, GroupRotationInfo)),
 	AvailabilityCores(Hash, Vec<CoreState>),
 	PersistedValidationData(Hash, ParaId, OccupiedCoreAssumption, Option<PersistedValidationData>),
+	AssumedValidationData(
+		Hash,
+		ParaId,
+		Hash,
+		Option<(PersistedValidationData, ValidationCodeHash)>,
+	),
 	CheckValidationOutputs(Hash, ParaId, CandidateCommitments, bool),
 	SessionIndexForChild(Hash, SessionIndex),
 	ValidationCode(Hash, ParaId, OccupiedCoreAssumption, Option<ValidationCode>),
@@ -342,4 +436,10 @@ pub(crate) enum RequestResult {
 		BTreeMap<ParaId, Vec<InboundHrmpMessage<BlockNumber>>>,
 	),
 	CurrentBabeEpoch(Hash, Epoch),
+	FetchOnChainVotes(Hash, Option<ScrapedOnChainVotes>),
+	PvfsRequirePrecheck(Hash, Vec<ValidationCodeHash>),
+	// This is a request with side-effects and no result, hence ().
+	SubmitPvfCheckStatement(Hash, PvfCheckStatement, ValidatorSignature, ()),
+	ValidationCodeHash(Hash, ParaId, OccupiedCoreAssumption, Option<ValidationCodeHash>),
+	Version(Hash, u32),
 }

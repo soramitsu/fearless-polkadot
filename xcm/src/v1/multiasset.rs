@@ -25,15 +25,12 @@
 
 use super::MultiLocation;
 use alloc::{vec, vec::Vec};
-use core::{
-	cmp::Ordering,
-	convert::{TryFrom, TryInto},
-	result,
-};
+use core::{cmp::Ordering, result};
 use parity_scale_codec::{self as codec, Decode, Encode};
+use scale_info::TypeInfo;
 
 /// A general identifier for an instance of a non-fungible asset class.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Encode, Decode, Debug)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Encode, Decode, Debug, TypeInfo)]
 pub enum AssetInstance {
 	/// Undefined - used if the non-fungible asset class has only one instance.
 	Undefined,
@@ -95,7 +92,7 @@ impl From<Vec<u8>> for AssetInstance {
 }
 
 /// Classification of an asset being concrete or abstract.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode, TypeInfo)]
 pub enum AssetId {
 	Concrete(MultiLocation),
 	Abstract(Vec<u8>),
@@ -115,9 +112,18 @@ impl From<Vec<u8>> for AssetId {
 
 impl AssetId {
 	/// Prepend a `MultiLocation` to a concrete asset, giving it a new root location.
-	pub fn reanchor(&mut self, prepend: &MultiLocation) -> Result<(), ()> {
+	pub fn prepend_with(&mut self, prepend: &MultiLocation) -> Result<(), ()> {
 		if let AssetId::Concrete(ref mut l) = self {
 			l.prepend_with(prepend.clone()).map_err(|_| ())?;
+		}
+		Ok(())
+	}
+
+	/// Mutate the asset to represent the same value from the perspective of a new `target`
+	/// location. The local chain's location is provided in `ancestry`.
+	pub fn reanchor(&mut self, target: &MultiLocation, ancestry: &MultiLocation) -> Result<(), ()> {
+		if let AssetId::Concrete(ref mut l) = self {
+			l.reanchor(target, ancestry)?;
 		}
 		Ok(())
 	}
@@ -135,7 +141,7 @@ impl AssetId {
 }
 
 /// Classification of whether an asset is fungible or not, along with a mandatory amount or instance.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode, TypeInfo)]
 pub enum Fungibility {
 	Fungible(#[codec(compact)] u128),
 	NonFungible(AssetInstance),
@@ -162,7 +168,7 @@ impl<T: Into<AssetInstance>> From<T> for Fungibility {
 	}
 }
 
-#[derive(Clone, Eq, PartialEq, Debug, Encode, Decode)]
+#[derive(Clone, Eq, PartialEq, Debug, Encode, Decode, TypeInfo)]
 pub struct MultiAsset {
 	pub id: AssetId,
 	pub fun: Fungibility,
@@ -202,13 +208,24 @@ impl MultiAsset {
 	}
 
 	/// Prepend a `MultiLocation` to a concrete asset, giving it a new root location.
-	pub fn reanchor(&mut self, prepend: &MultiLocation) -> Result<(), ()> {
-		self.id.reanchor(prepend)
+	pub fn prepend_with(&mut self, prepend: &MultiLocation) -> Result<(), ()> {
+		self.id.prepend_with(prepend)
 	}
 
-	/// Prepend a `MultiLocation` to a concrete asset, giving it a new root location.
-	pub fn reanchored(mut self, prepend: &MultiLocation) -> Result<Self, ()> {
-		self.reanchor(prepend)?;
+	/// Mutate the location of the asset identifier if concrete, giving it the same location
+	/// relative to a `target` context. The local context is provided as `ancestry`.
+	pub fn reanchor(&mut self, target: &MultiLocation, ancestry: &MultiLocation) -> Result<(), ()> {
+		self.id.reanchor(target, ancestry)
+	}
+
+	/// Mutate the location of the asset identifier if concrete, giving it the same location
+	/// relative to a `target` context. The local context is provided as `ancestry`.
+	pub fn reanchored(
+		mut self,
+		target: &MultiLocation,
+		ancestry: &MultiLocation,
+	) -> Result<Self, ()> {
+		self.id.reanchor(target, ancestry)?;
 		Ok(self)
 	}
 
@@ -266,7 +283,7 @@ impl TryFrom<Vec<super::super::v0::MultiAsset>> for MultiAsset {
 }
 
 /// A `Vec` of `MultiAsset`s. There may be no duplicate fungible items in here and when decoding, they must be sorted.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, TypeInfo)]
 pub struct MultiAssets(Vec<MultiAsset>);
 
 impl Decode for MultiAssets {
@@ -300,8 +317,10 @@ impl From<Vec<MultiAsset>> for MultiAssets {
 						(
 							MultiAsset { fun: Fungibility::Fungible(a_amount), id: a_id },
 							MultiAsset { fun: Fungibility::Fungible(b_amount), id: b_id },
-						) if a_id == b_id =>
-							MultiAsset { id: a_id, fun: Fungibility::Fungible(a_amount + b_amount) },
+						) if a_id == b_id => MultiAsset {
+							id: a_id,
+							fun: Fungibility::Fungible(a_amount.saturating_add(b_amount)),
+						},
 						(
 							MultiAsset { fun: Fungibility::NonFungible(a_instance), id: a_id },
 							MultiAsset { fun: Fungibility::NonFungible(b_instance), id: b_id },
@@ -412,8 +431,13 @@ impl MultiAssets {
 	}
 
 	/// Prepend a `MultiLocation` to any concrete asset items, giving it a new root location.
-	pub fn reanchor(&mut self, prepend: &MultiLocation) -> Result<(), ()> {
-		self.0.iter_mut().try_for_each(|i| i.reanchor(prepend))
+	pub fn prepend_with(&mut self, prefix: &MultiLocation) -> Result<(), ()> {
+		self.0.iter_mut().try_for_each(|i| i.prepend_with(prefix))
+	}
+
+	/// Prepend a `MultiLocation` to any concrete asset items, giving it a new root location.
+	pub fn reanchor(&mut self, target: &MultiLocation, ancestry: &MultiLocation) -> Result<(), ()> {
+		self.0.iter_mut().try_for_each(|i| i.reanchor(target, ancestry))
 	}
 
 	/// Return a reference to an item at a specific index or `None` if it doesn't exist.
@@ -422,14 +446,14 @@ impl MultiAssets {
 	}
 }
 /// Classification of whether an asset is fungible or not.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode, TypeInfo)]
 pub enum WildFungibility {
 	Fungible,
 	NonFungible,
 }
 
 /// A wildcard representing a set of assets.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode, TypeInfo)]
 pub enum WildMultiAsset {
 	/// All assets in the holding register, up to `usize` individual assets (different instances of non-fungibles could
 	/// be separate assets).
@@ -482,10 +506,10 @@ impl WildMultiAsset {
 	}
 
 	/// Prepend a `MultiLocation` to any concrete asset components, giving it a new root location.
-	pub fn reanchor(&mut self, prepend: &MultiLocation) -> Result<(), ()> {
+	pub fn reanchor(&mut self, target: &MultiLocation, ancestry: &MultiLocation) -> Result<(), ()> {
 		use WildMultiAsset::*;
 		match self {
-			AllOf { ref mut id, .. } => id.reanchor(prepend).map_err(|_| ()),
+			AllOf { ref mut id, .. } => id.reanchor(target, ancestry).map_err(|_| ()),
 			All => Ok(()),
 		}
 	}
@@ -501,7 +525,7 @@ impl<A: Into<AssetId>, B: Into<WildFungibility>> From<(A, B)> for WildMultiAsset
 ///
 /// Note: Vectors of wildcards whose encoding is supported in XCM v0 are unsupported
 /// in this implementation and will result in a decode error.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode, TypeInfo)]
 pub enum MultiAssetFilter {
 	Definite(MultiAssets),
 	Wild(WildMultiAsset),
@@ -544,10 +568,10 @@ impl MultiAssetFilter {
 	}
 
 	/// Prepend a `MultiLocation` to any concrete asset components, giving it a new root location.
-	pub fn reanchor(&mut self, prepend: &MultiLocation) -> Result<(), ()> {
+	pub fn reanchor(&mut self, target: &MultiLocation, ancestry: &MultiLocation) -> Result<(), ()> {
 		match self {
-			MultiAssetFilter::Definite(ref mut assets) => assets.reanchor(prepend),
-			MultiAssetFilter::Wild(ref mut wild) => wild.reanchor(prepend),
+			MultiAssetFilter::Definite(ref mut assets) => assets.reanchor(target, ancestry),
+			MultiAssetFilter::Wild(ref mut wild) => wild.reanchor(target, ancestry),
 		}
 	}
 }

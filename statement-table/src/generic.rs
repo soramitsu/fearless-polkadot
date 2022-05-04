@@ -30,7 +30,7 @@ use std::{
 	hash::Hash,
 };
 
-use primitives::v1::{ValidatorSignature, ValidityAttestation as PrimitiveValidityAttestation};
+use primitives::v2::{ValidatorSignature, ValidityAttestation as PrimitiveValidityAttestation};
 
 use parity_scale_codec::{Decode, Encode};
 
@@ -172,12 +172,12 @@ pub type MisbehaviorFor<Ctx> = Misbehavior<
 	<Ctx as Context>::Signature,
 >;
 
-// kinds of votes for validity
+// Kinds of votes for validity on a particular candidate.
 #[derive(Clone, PartialEq, Eq)]
 enum ValidityVote<Signature: Eq + Clone> {
-	// implicit validity vote by issuing
+	// Implicit validity vote.
 	Issued(Signature),
-	// direct validity vote
+	// Direct validity vote.
 	Valid(Signature),
 }
 

@@ -1,6 +1,7 @@
 use super::*;
+use ::test_helpers::{dummy_candidate_descriptor, dummy_hash};
 use bitvec::bitvec;
-use polkadot_primitives::v1::{OccupiedCore, ScheduledCore};
+use polkadot_primitives::v2::{OccupiedCore, ScheduledCore};
 
 pub fn occupied_core(para_id: u32) -> CoreState {
 	CoreState::Occupied(OccupiedCore {
@@ -9,8 +10,8 @@ pub fn occupied_core(para_id: u32) -> CoreState {
 		occupied_since: 100_u32,
 		time_out_at: 200_u32,
 		next_up_on_time_out: None,
-		availability: bitvec![bitvec::order::Lsb0, u8; 0; 32],
-		candidate_descriptor: Default::default(),
+		availability: bitvec![u8, bitvec::order::Lsb0; 0; 32],
+		candidate_descriptor: dummy_candidate_descriptor(dummy_hash()),
 		candidate_hash: Default::default(),
 	})
 }
@@ -30,17 +31,17 @@ where
 }
 
 pub fn default_bitvec(n_cores: usize) -> CoreAvailability {
-	bitvec![bitvec::order::Lsb0, u8; 0; n_cores]
+	bitvec![u8, bitvec::order::Lsb0; 0; n_cores]
 }
 
 pub fn scheduled_core(id: u32) -> ScheduledCore {
-	ScheduledCore { para_id: id.into(), ..Default::default() }
+	ScheduledCore { para_id: id.into(), collator: None }
 }
 
 mod select_availability_bitfields {
 	use super::{super::*, default_bitvec, occupied_core};
 	use futures::executor::block_on;
-	use polkadot_primitives::v1::{SigningContext, ValidatorId, ValidatorIndex};
+	use polkadot_primitives::v2::{ScheduledCore, SigningContext, ValidatorId, ValidatorIndex};
 	use sp_application_crypto::AppKey;
 	use sp_keystore::{testing::KeyStore, CryptoStore, SyncCryptoStorePtr};
 	use std::sync::Arc;
@@ -83,7 +84,8 @@ mod select_availability_bitfields {
 			block_on(signed_bitfield(&keystore, bitvec, ValidatorIndex(1))),
 		];
 
-		let mut selected_bitfields = select_availability_bitfields(&cores, &bitfields);
+		let mut selected_bitfields =
+			select_availability_bitfields(&cores, &bitfields, &Hash::repeat_byte(0));
 		selected_bitfields.sort_by_key(|bitfield| bitfield.validator_index());
 
 		assert_eq!(selected_bitfields.len(), 2);
@@ -109,8 +111,11 @@ mod select_availability_bitfields {
 		let mut bitvec2 = bitvec.clone();
 		bitvec2.set(2, true);
 
-		let cores =
-			vec![CoreState::Free, CoreState::Scheduled(Default::default()), occupied_core(2)];
+		let cores = vec![
+			CoreState::Free,
+			CoreState::Scheduled(ScheduledCore { para_id: Default::default(), collator: None }),
+			occupied_core(2),
+		];
 
 		let bitfields = vec![
 			block_on(signed_bitfield(&keystore, bitvec0, ValidatorIndex(0))),
@@ -118,7 +123,8 @@ mod select_availability_bitfields {
 			block_on(signed_bitfield(&keystore, bitvec2.clone(), ValidatorIndex(2))),
 		];
 
-		let selected_bitfields = select_availability_bitfields(&cores, &bitfields);
+		let selected_bitfields =
+			select_availability_bitfields(&cores, &bitfields, &Hash::repeat_byte(0));
 
 		// selects only the valid bitfield
 		assert_eq!(selected_bitfields.len(), 1);
@@ -141,7 +147,8 @@ mod select_availability_bitfields {
 			block_on(signed_bitfield(&keystore, bitvec1.clone(), ValidatorIndex(1))),
 		];
 
-		let selected_bitfields = select_availability_bitfields(&cores, &bitfields);
+		let selected_bitfields =
+			select_availability_bitfields(&cores, &bitfields, &Hash::repeat_byte(0));
 		assert_eq!(selected_bitfields.len(), 1);
 		assert_eq!(selected_bitfields[0].payload().0, bitvec1.clone());
 	}
@@ -178,7 +185,8 @@ mod select_availability_bitfields {
 			block_on(signed_bitfield(&keystore, bitvec1.clone(), ValidatorIndex(1))),
 		];
 
-		let selected_bitfields = select_availability_bitfields(&cores, &bitfields);
+		let selected_bitfields =
+			select_availability_bitfields(&cores, &bitfields, &Hash::repeat_byte(0));
 		assert_eq!(selected_bitfields.len(), 4);
 		assert_eq!(selected_bitfields[0].payload().0, bitvec0);
 		assert_eq!(selected_bitfields[1].payload().0, bitvec1);
@@ -189,6 +197,7 @@ mod select_availability_bitfields {
 
 mod select_candidates {
 	use super::{super::*, build_occupied_core, default_bitvec, occupied_core, scheduled_core};
+	use ::test_helpers::{dummy_candidate_descriptor, dummy_hash};
 	use polkadot_node_subsystem::messages::{
 		AllMessages, RuntimeApiMessage,
 		RuntimeApiRequest::{
@@ -196,9 +205,8 @@ mod select_candidates {
 		},
 	};
 	use polkadot_node_subsystem_test_helpers::TestSubsystemSender;
-	use polkadot_primitives::v1::{
-		BlockNumber, CandidateCommitments, CandidateDescriptor, CommittedCandidateReceipt,
-		PersistedValidationData,
+	use polkadot_primitives::v2::{
+		BlockNumber, CandidateCommitments, CommittedCandidateReceipt, PersistedValidationData,
 	};
 
 	const BLOCK_UNDER_PRODUCTION: BlockNumber = 128;
@@ -346,11 +354,10 @@ mod select_candidates {
 
 		let empty_hash = PersistedValidationData::<Hash, BlockNumber>::default().hash();
 
+		let mut descriptor_template = dummy_candidate_descriptor(dummy_hash());
+		descriptor_template.persisted_validation_data_hash = empty_hash;
 		let candidate_template = CandidateReceipt {
-			descriptor: CandidateDescriptor {
-				persisted_validation_data_hash: empty_hash,
-				..Default::default()
-			},
+			descriptor: descriptor_template,
 			commitments_hash: CandidateCommitments::default().hash(),
 		};
 
@@ -389,7 +396,7 @@ mod select_candidates {
 			.map(|c| BackedCandidate {
 				candidate: CommittedCandidateReceipt {
 					descriptor: c.descriptor.clone(),
-					..Default::default()
+					commitments: Default::default(),
 				},
 				validity_votes: Vec::new(),
 				validator_indices: default_bitvec(n_cores),
@@ -428,21 +435,21 @@ mod select_candidates {
 		let cores_with_code = [1, 4, 8];
 
 		let committed_receipts: Vec<_> = (0..mock_cores.len())
-			.map(|i| CommittedCandidateReceipt {
-				descriptor: CandidateDescriptor {
-					para_id: i.into(),
-					persisted_validation_data_hash: empty_hash,
-					..Default::default()
-				},
-				commitments: CandidateCommitments {
-					new_validation_code: if cores_with_code.contains(&i) {
-						Some(vec![].into())
-					} else {
-						None
+			.map(|i| {
+				let mut descriptor = dummy_candidate_descriptor(dummy_hash());
+				descriptor.para_id = i.into();
+				descriptor.persisted_validation_data_hash = empty_hash;
+				CommittedCandidateReceipt {
+					descriptor,
+					commitments: CandidateCommitments {
+						new_validation_code: if cores_with_code.contains(&i) {
+							Some(vec![].into())
+						} else {
+							None
+						},
+						..Default::default()
 					},
-					..Default::default()
-				},
-				..Default::default()
+				}
 			})
 			.collect();
 

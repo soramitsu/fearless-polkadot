@@ -17,74 +17,47 @@
 
 //! Error handling related code and Error/Result definitions.
 
+use polkadot_node_network_protocol::request_response::incoming;
 use polkadot_node_primitives::UncheckedSignedFullStatement;
+use polkadot_node_subsystem_util::runtime;
 use polkadot_subsystem::errors::SubsystemError;
-use thiserror::Error;
-
-use polkadot_node_subsystem_util::{runtime, unwrap_non_fatal, Fault};
 
 use crate::LOG_TARGET;
 
 /// General result.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Result for fatal only failures.
-pub type FatalResult<T> = std::result::Result<T, Fatal>;
+use fatality::Nested;
 
-/// Errors for statement distribution.
-#[derive(Debug, Error)]
-#[error(transparent)]
-pub struct Error(pub Fault<NonFatal, Fatal>);
-
-impl From<NonFatal> for Error {
-	fn from(e: NonFatal) -> Self {
-		Self(Fault::from_non_fatal(e))
-	}
-}
-
-impl From<Fatal> for Error {
-	fn from(f: Fatal) -> Self {
-		Self(Fault::from_fatal(f))
-	}
-}
-
-impl From<runtime::Error> for Error {
-	fn from(o: runtime::Error) -> Self {
-		Self(Fault::from_other(o))
-	}
-}
-
-/// Fatal runtime errors.
-#[derive(Debug, Error)]
-pub enum Fatal {
-	/// Receiving subsystem message from overseer failed.
+#[allow(missing_docs)]
+#[fatality::fatality(splitable)]
+pub enum Error {
+	#[fatal]
 	#[error("Receiving message from overseer failed")]
-	SubsystemReceive(#[source] SubsystemError),
+	SubsystemReceive(#[from] SubsystemError),
 
-	/// Errors coming from runtime::Runtime.
+	#[fatal(forward)]
+	#[error("Retrieving next incoming request failed")]
+	IncomingRequest(#[from] incoming::Error),
+
+	#[fatal(forward)]
 	#[error("Error while accessing runtime information")]
-	Runtime(#[from] runtime::Fatal),
-}
+	Runtime(#[from] runtime::Error),
 
-/// Errors for fetching of runtime information.
-#[derive(Debug, Error)]
-pub enum NonFatal {
-	/// Signature was invalid on received statement.
-	#[error("CollationSeconded contained statement with invalid signature.")]
+	#[error("CollationSeconded contained statement with invalid signature")]
 	InvalidStatementSignature(UncheckedSignedFullStatement),
-
-	/// Errors coming from runtime::Runtime.
-	#[error("Error while accessing runtime information")]
-	Runtime(#[from] runtime::NonFatal),
 }
 
 /// Utility for eating top level errors and log them.
 ///
 /// We basically always want to try and continue on error. This utility function is meant to
 /// consume top-level errors by simply logging them.
-pub fn log_error(result: Result<()>, ctx: &'static str) -> FatalResult<()> {
-	if let Some(error) = unwrap_non_fatal(result.map_err(|e| e.0))? {
-		tracing::warn!(target: LOG_TARGET, error = ?error, ctx)
+pub fn log_error(result: Result<()>, ctx: &'static str) -> std::result::Result<(), FatalError> {
+	match result.into_nested()? {
+		Ok(()) => Ok(()),
+		Err(jfyi) => {
+			gum::warn!(target: LOG_TARGET, error = ?jfyi, ctx);
+			Ok(())
+		},
 	}
-	Ok(())
 }

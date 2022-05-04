@@ -17,49 +17,21 @@
 
 //! Error handling related code and Error/Result definitions.
 
-use thiserror::Error;
-
 use polkadot_node_primitives::disputes::DisputeMessageCheckError;
-use polkadot_node_subsystem_util::{runtime, Fault};
+use polkadot_node_subsystem_util::runtime;
 use polkadot_subsystem::SubsystemError;
 
-#[derive(Debug, Error)]
-#[error(transparent)]
-pub struct Error(pub Fault<NonFatal, Fatal>);
-
-impl From<NonFatal> for Error {
-	fn from(e: NonFatal) -> Self {
-		Self(Fault::from_non_fatal(e))
-	}
-}
-
-impl From<Fatal> for Error {
-	fn from(f: Fatal) -> Self {
-		Self(Fault::from_fatal(f))
-	}
-}
-
-impl From<runtime::Error> for Error {
-	fn from(o: runtime::Error) -> Self {
-		Self(Fault::from_other(o))
-	}
-}
-
-/// Fatal errors of this subsystem.
-#[derive(Debug, Error)]
-pub enum Fatal {
-	/// Spawning a running task failed.
+#[allow(missing_docs)]
+#[fatality::fatality(splitable)]
+pub enum Error {
+	#[fatal]
 	#[error("Spawning subsystem task failed")]
 	SpawnTask(#[source] SubsystemError),
 
-	/// Errors coming from runtime::Runtime.
+	#[fatal(forward)]
 	#[error("Error while accessing runtime information")]
-	Runtime(#[from] runtime::Fatal),
-}
+	Runtime(#[from] runtime::Error),
 
-/// Non-fatal errors of this subsystem.
-#[derive(Debug, Error)]
-pub enum NonFatal {
 	/// We need available active heads for finding relevant authorities.
 	#[error("No active heads available - needed for finding relevant authorities.")]
 	NoActiveHeads,
@@ -95,11 +67,7 @@ pub enum NonFatal {
 	/// A statement's `ValidatorIndex` could not be looked up.
 	#[error("ValidatorIndex of statement could not be found")]
 	InvalidValidatorIndexFromCoordinator,
-
-	/// Errors coming from runtime::Runtime.
-	#[error("Error while accessing runtime information")]
-	Runtime(#[from] runtime::NonFatal),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-pub type NonFatalResult<T> = std::result::Result<T, NonFatal>;
+pub type JfyiErrorResult<T> = std::result::Result<T, JfyiError>;

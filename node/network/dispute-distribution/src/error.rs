@@ -17,81 +17,56 @@
 
 //! Error handling related code and Error/Result definitions.
 
-use thiserror::Error;
-
-use polkadot_node_subsystem_util::{runtime, unwrap_non_fatal, Fault};
+use polkadot_node_subsystem_util::runtime;
 use polkadot_subsystem::SubsystemError;
 
 use crate::{sender, LOG_TARGET};
 
-#[derive(Debug, Error)]
-#[error(transparent)]
-pub struct Error(pub Fault<NonFatal, Fatal>);
+use fatality::Nested;
 
-impl From<NonFatal> for Error {
-	fn from(e: NonFatal) -> Self {
-		Self(Fault::from_non_fatal(e))
-	}
-}
-
-impl From<Fatal> for Error {
-	fn from(f: Fatal) -> Self {
-		Self(Fault::from_fatal(f))
-	}
-}
-
-impl From<sender::Error> for Error {
-	fn from(e: sender::Error) -> Self {
-		match e.0 {
-			Fault::Fatal(f) => Self(Fault::Fatal(Fatal::Sender(f))),
-			Fault::Err(nf) => Self(Fault::Err(NonFatal::Sender(nf))),
-		}
-	}
-}
-
-/// Fatal errors of this subsystem.
-#[derive(Debug, Error)]
-pub enum Fatal {
+#[allow(missing_docs)]
+#[fatality::fatality(splitable)]
+pub enum Error {
 	/// Receiving subsystem message from overseer failed.
+	#[fatal]
 	#[error("Receiving message from overseer failed")]
 	SubsystemReceive(#[source] SubsystemError),
 
 	/// Spawning a running task failed.
+	#[fatal]
 	#[error("Spawning subsystem task failed")]
 	SpawnTask(#[source] SubsystemError),
 
 	/// `DisputeSender` mpsc receiver exhausted.
+	#[fatal]
 	#[error("Erasure chunk requester stream exhausted")]
 	SenderExhausted,
 
 	/// Errors coming from `runtime::Runtime`.
+	#[fatal(forward)]
 	#[error("Error while accessing runtime information")]
-	Runtime(#[from] runtime::Fatal),
+	Runtime(#[from] runtime::Error),
 
 	/// Errors coming from `DisputeSender`
+	#[fatal(forward)]
 	#[error("Error while accessing runtime information")]
-	Sender(#[from] sender::Fatal),
-}
-
-/// Non-fatal errors of this subsystem.
-#[derive(Debug, Error)]
-pub enum NonFatal {
-	/// Errors coming from `DisputeSender`
-	#[error("Error while accessing runtime information")]
-	Sender(#[from] sender::NonFatal),
+	Sender(#[from] sender::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub type FatalResult<T> = std::result::Result<T, Fatal>;
+pub type FatalResult<T> = std::result::Result<T, FatalError>;
 
 /// Utility for eating top level errors and log them.
 ///
 /// We basically always want to try and continue on error. This utility function is meant to
 /// consume top-level errors by simply logging them
-pub fn log_error(result: Result<()>, ctx: &'static str) -> std::result::Result<(), Fatal> {
-	if let Some(error) = unwrap_non_fatal(result.map_err(|e| e.0))? {
-		tracing::warn!(target: LOG_TARGET, error = ?error, ctx);
+pub fn log_error(result: Result<()>, ctx: &'static str) -> std::result::Result<(), FatalError> {
+	match result.into_nested()? {
+		Err(jfyi) => {
+			gum::warn!(target: LOG_TARGET, error = ?jfyi, ctx);
+			Ok(())
+		},
+		Ok(()) => Ok(()),
 	}
-	Ok(())
 }

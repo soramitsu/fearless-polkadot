@@ -21,10 +21,11 @@ use crate::{
 use frame_support::{pallet_prelude::*, traits::ReservableCurrency};
 use frame_system::pallet_prelude::*;
 use parity_scale_codec::{Decode, Encode};
-use primitives::v1::{
+use primitives::v2::{
 	Balance, Hash, HrmpChannelId, Id as ParaId, InboundHrmpMessage, OutboundHrmpMessage,
 	SessionIndex,
 };
+use scale_info::TypeInfo;
 use sp_runtime::traits::{AccountIdConversion, BlakeTwo256, Hash as HashT, UniqueSaturatedInto};
 use sp_std::{
 	collections::{btree_map::BTreeMap, btree_set::BTreeSet},
@@ -34,13 +35,69 @@ use sp_std::{
 
 pub use pallet::*;
 
+/// Maximum bound that can be set for inbound channels.
+///
+/// If inaccurate, the weighing of this pallet might become inaccurate. It is expected form the
+/// `configurations` pallet to check these values before setting
+pub const HRMP_MAX_INBOUND_CHANNELS_BOUND: u32 = 128;
+/// Same as [`HRMP_MAX_INBOUND_CHANNELS_BOUND`], but for outbound channels.
+pub const HRMP_MAX_OUTBOUND_CHANNELS_BOUND: u32 = 128;
+
+#[cfg(test)]
+pub(crate) mod tests;
+
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+
+pub trait WeightInfo {
+	fn hrmp_init_open_channel() -> Weight;
+	fn hrmp_accept_open_channel() -> Weight;
+	fn hrmp_close_channel() -> Weight;
+	fn force_clean_hrmp(i: u32, e: u32) -> Weight;
+	fn force_process_hrmp_open(c: u32) -> Weight;
+	fn force_process_hrmp_close(c: u32) -> Weight;
+	fn hrmp_cancel_open_request(c: u32) -> Weight;
+	fn clean_open_channel_requests(c: u32) -> Weight;
+}
+
+/// A weight info that is only suitable for testing.
+pub struct TestWeightInfo;
+
+impl WeightInfo for TestWeightInfo {
+	fn hrmp_accept_open_channel() -> Weight {
+		Weight::MAX
+	}
+	fn force_clean_hrmp(_: u32, _: u32) -> Weight {
+		Weight::MAX
+	}
+	fn force_process_hrmp_close(_: u32) -> Weight {
+		Weight::MAX
+	}
+	fn force_process_hrmp_open(_: u32) -> Weight {
+		Weight::MAX
+	}
+	fn hrmp_cancel_open_request(_: u32) -> Weight {
+		Weight::MAX
+	}
+	fn hrmp_close_channel() -> Weight {
+		Weight::MAX
+	}
+	fn hrmp_init_open_channel() -> Weight {
+		Weight::MAX
+	}
+	fn clean_open_channel_requests(_: u32) -> Weight {
+		Weight::MAX
+	}
+}
+
 /// A description of a request to open an HRMP channel.
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, TypeInfo)]
 pub struct HrmpOpenChannelRequest {
 	/// Indicates if this request was confirmed by the recipient.
 	pub confirmed: bool,
-	/// How many session boundaries ago this request was seen.
-	pub age: SessionIndex,
+	/// NOTE: this field is deprecated. Channel open requests became non-expiring and this value
+	/// became unused.
+	pub _age: SessionIndex,
 	/// The amount that the sender supplied at the time of creation of this request.
 	pub sender_deposit: Balance,
 	/// The maximum message size that could be put into the channel.
@@ -52,7 +109,7 @@ pub struct HrmpOpenChannelRequest {
 }
 
 /// A metadata of an HRMP channel.
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, TypeInfo)]
 #[cfg_attr(test, derive(Debug))]
 pub struct HrmpChannel {
 	// NOTE: This structure is used by parachains via merkle proofs. Therefore, this struct requires
@@ -141,8 +198,9 @@ impl fmt::Debug for OutboundHrmpAcceptanceErr {
 				"more HRMP messages than permitted by config ({} > {})",
 				sent, permitted,
 			),
-			NotSorted { idx } =>
-				write!(fmt, "the HRMP messages are not sorted (first unsorted is at index {})", idx,),
+			NotSorted { idx } => {
+				write!(fmt, "the HRMP messages are not sorted (first unsorted is at index {})", idx,)
+			},
 			NoSuchChannel { idx, channel_id } => write!(
 				fmt,
 				"the HRMP message at index {} is sent to a non existent channel {:?}->{:?}",
@@ -173,6 +231,7 @@ pub mod pallet {
 
 	#[pallet::pallet]
 	#[pallet::generate_store(pub(super) trait Store)]
+	#[pallet::without_storage_info]
 	pub struct Pallet<T>(_);
 
 	#[pallet::config]
@@ -188,10 +247,13 @@ pub mod pallet {
 
 		/// An interface for reserving deposits for opening channels.
 		///
-		/// NOTE that this Currency instance will be charged with the amounts defined in the `Configuration`
-		/// pallet. Specifically, that means that the `Balance` of the `Currency` implementation should
-		/// be the same as `Balance` as used in the `Configuration`.
+		/// NOTE that this Currency instance will be charged with the amounts defined in the
+		/// `Configuration` pallet. Specifically, that means that the `Balance` of the `Currency`
+		/// implementation should be the same as `Balance` as used in the `Configuration`.
 		type Currency: ReservableCurrency<Self::AccountId>;
+
+		/// Something that provides the weight of this pallet.
+		type WeightInfo: WeightInfo;
 	}
 
 	#[pallet::event]
@@ -200,6 +262,9 @@ pub mod pallet {
 		/// Open HRMP channel requested.
 		/// `[sender, recipient, proposed_max_capacity, proposed_max_message_size]`
 		OpenChannelRequested(ParaId, ParaId, u32, u32),
+		/// An HRMP channel request sent by the receiver was canceled by either party.
+		/// `[by_parachain, channel_id]`
+		OpenChannelCanceled(ParaId, HrmpChannelId),
 		/// Open HRMP channel accepted. `[sender, recipient]`
 		OpenChannelAccepted(ParaId, ParaId),
 		/// HRMP channel closed. `[by_parachain, channel_id]`
@@ -238,6 +303,14 @@ pub mod pallet {
 		CloseHrmpChannelDoesntExist,
 		/// The channel close request is already requested.
 		CloseHrmpChannelAlreadyUnderway,
+		/// Canceling is requested by neither the sender nor recipient of the open channel request.
+		CancelHrmpOpenChannelUnauthorized,
+		/// The open request doesn't exist.
+		OpenHrmpChannelDoesntExist,
+		/// Cannot cancel an HRMP open channel request because it is already confirmed.
+		OpenHrmpChannelAlreadyConfirmed,
+		/// The provided witness data is wrong.
+		WrongWitness,
 	}
 
 	/// The set of pending HRMP open channel requests.
@@ -250,13 +323,16 @@ pub mod pallet {
 	pub type HrmpOpenChannelRequests<T: Config> =
 		StorageMap<_, Twox64Concat, HrmpChannelId, HrmpOpenChannelRequest>;
 
+	// NOTE: could become bounded, but we don't have a global maximum for this.
+	// `HRMP_MAX_INBOUND_CHANNELS_BOUND` are per parachain/parathread, while this storage tracks the
+	// global state.
 	#[pallet::storage]
 	pub type HrmpOpenChannelRequestsList<T: Config> =
 		StorageValue<_, Vec<HrmpChannelId>, ValueQuery>;
 
 	/// This mapping tracks how many open channel requests are initiated by a given sender para.
-	/// Invariant: `HrmpOpenChannelRequests` should contain the same number of items that has `(X, _)`
-	/// as the number of `HrmpOpenChannelRequestCount` for `X`.
+	/// Invariant: `HrmpOpenChannelRequests` should contain the same number of items that has
+	/// `(X, _)` as the number of `HrmpOpenChannelRequestCount` for `X`.
 	#[pallet::storage]
 	pub type HrmpOpenChannelRequestCount<T: Config> =
 		StorageMap<_, Twox64Concat, ParaId, u32, ValueQuery>;
@@ -268,8 +344,8 @@ pub mod pallet {
 	pub type HrmpAcceptedChannelRequestCount<T: Config> =
 		StorageMap<_, Twox64Concat, ParaId, u32, ValueQuery>;
 
-	/// A set of pending HRMP close channel requests that are going to be closed during the session change.
-	/// Used for checking if a given channel is registered for closure.
+	/// A set of pending HRMP close channel requests that are going to be closed during the session
+	/// change. Used for checking if a given channel is registered for closure.
 	///
 	/// The set is accompanied by a list for iteration.
 	///
@@ -294,17 +370,17 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type HrmpChannels<T: Config> = StorageMap<_, Twox64Concat, HrmpChannelId, HrmpChannel>;
 
-	/// Ingress/egress indexes allow to find all the senders and receivers given the opposite
-	/// side. I.e.
+	/// Ingress/egress indexes allow to find all the senders and receivers given the opposite side.
+	/// I.e.
 	///
 	/// (a) ingress index allows to find all the senders for a given recipient.
 	/// (b) egress index allows to find all the recipients for a given sender.
 	///
 	/// Invariants:
-	/// - for each ingress index entry for `P` each item `I` in the index should present in `HrmpChannels`
-	///   as `(I, P)`.
-	/// - for each egress index entry for `P` each item `E` in the index should present in `HrmpChannels`
-	///   as `(P, E)`.
+	/// - for each ingress index entry for `P` each item `I` in the index should present in
+	///   `HrmpChannels` as `(I, P)`.
+	/// - for each egress index entry for `P` each item `E` in the index should present in
+	///   `HrmpChannels` as `(P, E)`.
 	/// - there should be no other dangling channels in `HrmpChannels`.
 	/// - the vectors are sorted.
 	#[pallet::storage]
@@ -328,27 +404,28 @@ pub mod pallet {
 		ValueQuery,
 	>;
 
-	/// Maintains a mapping that can be used to answer the question:
-	/// What paras sent a message at the given block number for a given receiver.
-	/// Invariants:
+	/// Maintains a mapping that can be used to answer the question: What paras sent a message at
+	/// the given block number for a given receiver. Invariants:
 	/// - The inner `Vec<ParaId>` is never empty.
 	/// - The inner `Vec<ParaId>` cannot store two same `ParaId`.
-	/// - The outer vector is sorted ascending by block number and cannot store two items with the same
-	///   block number.
+	/// - The outer vector is sorted ascending by block number and cannot store two items with the
+	///   same block number.
 	#[pallet::storage]
 	pub type HrmpChannelDigests<T: Config> =
 		StorageMap<_, Twox64Concat, ParaId, Vec<(T::BlockNumber, Vec<ParaId>)>, ValueQuery>;
 
 	/// Preopen the given HRMP channels.
 	///
-	/// The values in the tuple corresponds to `(sender, recipient, max_capacity, max_message_size)`,
-	/// i.e. similar to `init_open_channel`. In fact, the initialization is performed as if
-	/// the `init_open_channel` and `accept_open_channel` were called with the respective parameters
-	/// and the session change take place.
+	/// The values in the tuple corresponds to
+	/// `(sender, recipient, max_capacity, max_message_size)`, i.e. similar to `init_open_channel`.
+	/// In fact, the initialization is performed as if the `init_open_channel` and
+	/// `accept_open_channel` were called with the respective parameters and the session change take
+	///  place.
 	///
 	/// As such, each channel initializer should satisfy the same constraints, namely:
 	///
-	/// 1. `max_capacity` and `max_message_size` should be within the limits set by the configuration pallet.
+	/// 1. `max_capacity` and `max_message_size` should be within the limits set by the
+	///    configuration pallet.
 	/// 2. `sender` and `recipient` must be valid paras.
 	#[pallet::genesis_config]
 	pub struct GenesisConfig {
@@ -375,13 +452,13 @@ pub mod pallet {
 		/// parameters.
 		///
 		/// - `proposed_max_capacity` - specifies how many messages can be in the channel at once.
-		/// - `proposed_max_message_size` - specifies the maximum size of any of the messages.
+		/// - `proposed_max_message_size` - specifies the maximum size of the messages.
 		///
 		/// These numbers are a subject to the relay-chain configuration limits.
 		///
 		/// The channel can be opened only after the recipient confirms it and only on a session
 		/// change.
-		#[pallet::weight(0)]
+		#[pallet::weight(<T as Config>::WeightInfo::hrmp_init_open_channel())]
 		pub fn hrmp_init_open_channel(
 			origin: OriginFor<T>,
 			recipient: ParaId,
@@ -407,7 +484,7 @@ pub mod pallet {
 		/// Accept a pending open channel request from the given sender.
 		///
 		/// The channel will be opened only on the next session boundary.
-		#[pallet::weight(0)]
+		#[pallet::weight(<T as Config>::WeightInfo::hrmp_accept_open_channel())]
 		pub fn hrmp_accept_open_channel(origin: OriginFor<T>, sender: ParaId) -> DispatchResult {
 			let origin = ensure_parachain(<T as Config>::Origin::from(origin))?;
 			Self::accept_open_channel(origin, sender)?;
@@ -419,7 +496,7 @@ pub mod pallet {
 		/// recipient in the channel being closed.
 		///
 		/// The closure can only happen on a session change.
-		#[pallet::weight(0)]
+		#[pallet::weight(<T as Config>::WeightInfo::hrmp_close_channel())]
 		pub fn hrmp_close_channel(
 			origin: OriginFor<T>,
 			channel_id: HrmpChannelId,
@@ -435,8 +512,15 @@ pub mod pallet {
 		/// you to trigger the cleanup immediately for a specific parachain.
 		///
 		/// Origin must be Root.
-		#[pallet::weight(0)]
-		pub fn force_clean_hrmp(origin: OriginFor<T>, para: ParaId) -> DispatchResult {
+		///
+		/// Number of inbound and outbound channels for `para` must be provided as witness data of weighing.
+		#[pallet::weight(<T as Config>::WeightInfo::force_clean_hrmp(*_inbound, *_outbound))]
+		pub fn force_clean_hrmp(
+			origin: OriginFor<T>,
+			para: ParaId,
+			_inbound: u32,
+			_outbound: u32,
+		) -> DispatchResult {
 			ensure_root(origin)?;
 			Self::clean_hrmp_after_outgoing(&para);
 			Ok(())
@@ -446,8 +530,10 @@ pub mod pallet {
 		///
 		/// If there are pending HRMP open channel requests, you can use this
 		/// function process all of those requests immediately.
-		#[pallet::weight(0)]
-		pub fn force_process_hrmp_open(origin: OriginFor<T>) -> DispatchResult {
+		///
+		/// Total number of opening channels must be provided as witness data of weighing.
+		#[pallet::weight(<T as Config>::WeightInfo::force_process_hrmp_open(*_channels))]
+		pub fn force_process_hrmp_open(origin: OriginFor<T>, _channels: u32) -> DispatchResult {
 			ensure_root(origin)?;
 			let host_config = configuration::Pallet::<T>::config();
 			Self::process_hrmp_open_channel_requests(&host_config);
@@ -458,10 +544,37 @@ pub mod pallet {
 		///
 		/// If there are pending HRMP close channel requests, you can use this
 		/// function process all of those requests immediately.
-		#[pallet::weight(0)]
-		pub fn force_process_hrmp_close(origin: OriginFor<T>) -> DispatchResult {
+		///
+		/// Total number of closing channels must be provided as witness data of weighing.
+		#[pallet::weight(<T as Config>::WeightInfo::force_process_hrmp_close(*_channels))]
+		pub fn force_process_hrmp_close(origin: OriginFor<T>, _channels: u32) -> DispatchResult {
 			ensure_root(origin)?;
 			Self::process_hrmp_close_channel_requests();
+			Ok(())
+		}
+
+		/// This cancels a pending open channel request. It can be canceled by either of the sender
+		/// or the recipient for that request. The origin must be either of those.
+		///
+		/// The cancellation happens immediately. It is not possible to cancel the request if it is
+		/// already accepted.
+		///
+		/// Total number of open requests (i.e. `HrmpOpenChannelRequestsList`) must be provided as
+		/// witness data.
+		#[pallet::weight(<T as Config>::WeightInfo::hrmp_cancel_open_request(*open_requests))]
+		pub fn hrmp_cancel_open_request(
+			origin: OriginFor<T>,
+			channel_id: HrmpChannelId,
+			open_requests: u32,
+		) -> DispatchResult {
+			let origin = ensure_parachain(<T as Config>::Origin::from(origin))?;
+			ensure!(
+				<Self as Store>::HrmpOpenChannelRequestsList::decode_len().unwrap_or_default()
+					as u32 <= open_requests,
+				Error::<T>::WrongWitness
+			);
+			Self::cancel_open_request(origin, channel_id.clone())?;
+			Self::deposit_event(Event::OpenChannelCanceled(origin, channel_id));
 			Ok(())
 		}
 	}
@@ -506,18 +619,96 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn initializer_on_new_session(
 		notification: &initializer::SessionChangeNotification<T::BlockNumber>,
 		outgoing_paras: &[ParaId],
-	) {
-		Self::perform_outgoing_para_cleanup(outgoing_paras);
+	) -> Weight {
+		let w1 = Self::perform_outgoing_para_cleanup(&notification.prev_config, outgoing_paras);
 		Self::process_hrmp_open_channel_requests(&notification.prev_config);
 		Self::process_hrmp_close_channel_requests();
+		w1.saturating_add(<T as Config>::WeightInfo::force_process_hrmp_open(
+			outgoing_paras.len() as u32
+		))
+		.saturating_add(<T as Config>::WeightInfo::force_process_hrmp_close(
+			outgoing_paras.len() as u32
+		))
 	}
 
 	/// Iterate over all paras that were noted for offboarding and remove all the data
 	/// associated with them.
-	fn perform_outgoing_para_cleanup(outgoing: &[ParaId]) {
+	fn perform_outgoing_para_cleanup(
+		config: &HostConfiguration<T::BlockNumber>,
+		outgoing: &[ParaId],
+	) -> Weight {
+		let mut w = Self::clean_open_channel_requests(config, outgoing);
 		for outgoing_para in outgoing {
 			Self::clean_hrmp_after_outgoing(outgoing_para);
+
+			// we need a few extra bits of data to weigh this -- all of this is read internally
+			// anyways, so no overhead.
+			let ingress_count = <Self as Store>::HrmpIngressChannelsIndex::decode_len(outgoing_para)
+				.unwrap_or_default() as u32;
+			let egress_count = <Self as Store>::HrmpEgressChannelsIndex::decode_len(outgoing_para)
+				.unwrap_or_default() as u32;
+			w = w.saturating_add(<T as Config>::WeightInfo::force_clean_hrmp(
+				ingress_count,
+				egress_count,
+			));
 		}
+		w
+	}
+
+	// Go over the HRMP open channel requests and remove all in which offboarding paras participate.
+	//
+	// This will also perform the refunds for the counterparty if it doesn't offboard.
+	pub(crate) fn clean_open_channel_requests(
+		config: &HostConfiguration<T::BlockNumber>,
+		outgoing: &[ParaId],
+	) -> Weight {
+		// First collect all the channel ids of the open requests in which there is at least one
+		// party presents in the outgoing list.
+		//
+		// Both the open channel request list and outgoing list are expected to be small enough.
+		// In the most common case there will be only single outgoing para.
+		let open_channel_reqs = <Self as Store>::HrmpOpenChannelRequestsList::get();
+		let (go, stay): (Vec<HrmpChannelId>, Vec<HrmpChannelId>) = open_channel_reqs
+			.into_iter()
+			.partition(|req_id| outgoing.iter().any(|id| req_id.is_participant(*id)));
+		<Self as Store>::HrmpOpenChannelRequestsList::put(stay);
+
+		// Then iterate over all open requests to be removed, pull them out of the set and perform
+		// the refunds if applicable.
+		for req_id in go {
+			let req_data = match <Self as Store>::HrmpOpenChannelRequests::take(&req_id) {
+				Some(req_data) => req_data,
+				None => {
+					// Can't normally happen but no need to panic.
+					continue
+				},
+			};
+
+			// Return the deposit of the sender, but only if it is not the para being offboarded.
+			if !outgoing.contains(&req_id.sender) {
+				T::Currency::unreserve(
+					&req_id.sender.into_account(),
+					req_data.sender_deposit.unique_saturated_into(),
+				);
+			}
+
+			// If the request was confirmed, then it means it was confirmed in the finished session.
+			// Therefore, the config's hrmp_recipient_deposit represents the actual value of the
+			// deposit.
+			//
+			// We still want to refund the deposit only if the para is not being offboarded.
+			if req_data.confirmed {
+				if !outgoing.contains(&req_id.recipient) {
+					T::Currency::unreserve(
+						&req_id.recipient.into_account(),
+						config.hrmp_recipient_deposit.unique_saturated_into(),
+					);
+				}
+				Self::decrease_accepted_channel_request_count(req_id.recipient);
+			}
+		}
+
+		<T as Config>::WeightInfo::clean_open_channel_requests(outgoing.len() as u32)
 	}
 
 	/// Remove all storage entries associated with the given para.
@@ -561,7 +752,7 @@ impl<T: Config> Pallet<T> {
 
 			idx -= 1;
 			let channel_id = open_req_channels[idx].clone();
-			let mut request = <Self as Store>::HrmpOpenChannelRequests::get(&channel_id).expect(
+			let request = <Self as Store>::HrmpOpenChannelRequests::get(&channel_id).expect(
 				"can't be `None` due to the invariant that the list contains the same items as the set; qed",
 			);
 
@@ -595,52 +786,11 @@ impl<T: Config> Pallet<T> {
 					});
 				}
 
-				let new_open_channel_req_cnt =
-					<Self as Store>::HrmpOpenChannelRequestCount::get(&channel_id.sender)
-						.saturating_sub(1);
-				if new_open_channel_req_cnt != 0 {
-					<Self as Store>::HrmpOpenChannelRequestCount::insert(
-						&channel_id.sender,
-						new_open_channel_req_cnt,
-					);
-				} else {
-					<Self as Store>::HrmpOpenChannelRequestCount::remove(&channel_id.sender);
-				}
-
-				let new_accepted_channel_req_cnt =
-					<Self as Store>::HrmpAcceptedChannelRequestCount::get(&channel_id.recipient)
-						.saturating_sub(1);
-				if new_accepted_channel_req_cnt != 0 {
-					<Self as Store>::HrmpAcceptedChannelRequestCount::insert(
-						&channel_id.recipient,
-						new_accepted_channel_req_cnt,
-					);
-				} else {
-					<Self as Store>::HrmpAcceptedChannelRequestCount::remove(&channel_id.recipient);
-				}
+				Self::decrease_open_channel_request_count(channel_id.sender);
+				Self::decrease_accepted_channel_request_count(channel_id.recipient);
 
 				let _ = open_req_channels.swap_remove(idx);
 				<Self as Store>::HrmpOpenChannelRequests::remove(&channel_id);
-			} else {
-				request.age += 1;
-				if request.age == config.hrmp_open_request_ttl {
-					// got stale
-					<Self as Store>::HrmpOpenChannelRequestCount::mutate(&channel_id.sender, |v| {
-						*v -= 1;
-					});
-
-					let _ = open_req_channels.swap_remove(idx);
-					if let Some(HrmpOpenChannelRequest { sender_deposit, .. }) =
-						<Self as Store>::HrmpOpenChannelRequests::take(&channel_id)
-					{
-						T::Currency::unreserve(
-							&channel_id.sender.into_account(),
-							sender_deposit.unique_saturated_into(),
-						);
-					}
-				} else {
-					<Self as Store>::HrmpOpenChannelRequests::insert(&channel_id, request);
-				}
 			}
 		}
 
@@ -937,8 +1087,8 @@ impl<T: Config> Pallet<T> {
 	/// Initiate opening a channel from a parachain to a given recipient with given channel
 	/// parameters.
 	///
-	/// Basically the same as [`hrmp_init_open_channel`](Pallet::hrmp_init_open_channel) but intendend for calling directly from
-	/// other pallets rather than dispatched.
+	/// Basically the same as [`hrmp_init_open_channel`](Pallet::hrmp_init_open_channel) but
+	/// intended for calling directly from other pallets rather than dispatched.
 	pub fn init_open_channel(
 		origin: ParaId,
 		recipient: ParaId,
@@ -991,12 +1141,14 @@ impl<T: Config> Pallet<T> {
 			config.hrmp_sender_deposit.unique_saturated_into(),
 		)?;
 
+		// mutating storage directly now -- shall not bail henceforth.
+
 		<Self as Store>::HrmpOpenChannelRequestCount::insert(&origin, open_req_cnt + 1);
 		<Self as Store>::HrmpOpenChannelRequests::insert(
 			&channel_id,
 			HrmpOpenChannelRequest {
 				confirmed: false,
-				age: 0,
+				_age: 0,
 				sender_deposit: config.hrmp_sender_deposit,
 				max_capacity: proposed_max_capacity,
 				max_message_size: proposed_max_message_size,
@@ -1007,13 +1159,13 @@ impl<T: Config> Pallet<T> {
 
 		let notification_bytes = {
 			use parity_scale_codec::Encode as _;
-			use xcm::opaque::{v1::Xcm, VersionedXcm};
+			use xcm::opaque::{latest::prelude::*, VersionedXcm};
 
-			VersionedXcm::from(Xcm::HrmpNewChannelOpenRequest {
+			VersionedXcm::from(Xcm(vec![HrmpNewChannelOpenRequest {
 				sender: u32::from(origin),
 				max_capacity: proposed_max_capacity,
 				max_message_size: proposed_max_message_size,
-			})
+			}]))
 			.encode()
 		};
 		if let Err(dmp::QueueDownwardMessageError::ExceedsMaxMessageSize) =
@@ -1021,6 +1173,10 @@ impl<T: Config> Pallet<T> {
 		{
 			// this should never happen unless the max downward message size is configured to an
 			// jokingly small number.
+			log::error!(
+				target: "runtime::hrmp",
+				"sending 'init_open_channel::notification_bytes' failed."
+			);
 			debug_assert!(false);
 		}
 
@@ -1030,7 +1186,7 @@ impl<T: Config> Pallet<T> {
 	/// Accept a pending open channel request from the given sender.
 	///
 	/// Basically the same as [`hrmp_accept_open_channel`](Pallet::hrmp_accept_open_channel) but
-	/// intendend for calling directly from other pallets rather than dispatched.
+	/// intended for calling directly from other pallets rather than dispatched.
 	pub fn accept_open_channel(origin: ParaId, sender: ParaId) -> DispatchResult {
 		let channel_id = HrmpChannelId { sender, recipient: origin };
 		let mut channel_req = <Self as Store>::HrmpOpenChannelRequests::get(&channel_id)
@@ -1066,27 +1222,58 @@ impl<T: Config> Pallet<T> {
 
 		let notification_bytes = {
 			use parity_scale_codec::Encode as _;
-			use xcm::opaque::{v1::Xcm, VersionedXcm};
-
-			VersionedXcm::from(Xcm::HrmpChannelAccepted { recipient: u32::from(origin) }).encode()
+			use xcm::opaque::{latest::prelude::*, VersionedXcm};
+			let xcm = Xcm(vec![HrmpChannelAccepted { recipient: u32::from(origin) }]);
+			VersionedXcm::from(xcm).encode()
 		};
 		if let Err(dmp::QueueDownwardMessageError::ExceedsMaxMessageSize) =
 			<dmp::Pallet<T>>::queue_downward_message(&config, sender, notification_bytes)
 		{
 			// this should never happen unless the max downward message size is configured to an
 			// jokingly small number.
+			log::error!(
+				target: "runtime::hrmp",
+				"sending 'accept_open_channel::notification_bytes' failed."
+			);
 			debug_assert!(false);
 		}
 
 		Ok(())
 	}
 
+	fn cancel_open_request(origin: ParaId, channel_id: HrmpChannelId) -> DispatchResult {
+		// check if the origin is allowed to close the channel.
+		ensure!(channel_id.is_participant(origin), Error::<T>::CancelHrmpOpenChannelUnauthorized);
+
+		let open_channel_req = <Self as Store>::HrmpOpenChannelRequests::get(&channel_id)
+			.ok_or(Error::<T>::OpenHrmpChannelDoesntExist)?;
+		ensure!(!open_channel_req.confirmed, Error::<T>::OpenHrmpChannelAlreadyConfirmed);
+
+		// Remove the request by the channel id and sync the accompanying list with the set.
+		<Self as Store>::HrmpOpenChannelRequests::remove(&channel_id);
+		<Self as Store>::HrmpOpenChannelRequestsList::mutate(|open_req_channels| {
+			if let Some(pos) = open_req_channels.iter().position(|x| x == &channel_id) {
+				open_req_channels.swap_remove(pos);
+			}
+		});
+
+		Self::decrease_open_channel_request_count(channel_id.sender);
+		// Don't decrease `HrmpAcceptedChannelRequestCount` because we don't consider confirmed
+		// requests here.
+
+		// Unreserve the sender's deposit. The recipient could not have left their deposit because
+		// we ensured that the request is not confirmed.
+		T::Currency::unreserve(
+			&channel_id.sender.into_account(),
+			open_channel_req.sender_deposit.unique_saturated_into(),
+		);
+
+		Ok(())
+	}
+
 	fn close_channel(origin: ParaId, channel_id: HrmpChannelId) -> Result<(), Error<T>> {
 		// check if the origin is allowed to close the channel.
-		ensure!(
-			origin == channel_id.sender || origin == channel_id.recipient,
-			Error::<T>::CloseHrmpChannelUnauthorized,
-		);
+		ensure!(channel_id.is_participant(origin), Error::<T>::CloseHrmpChannelUnauthorized);
 
 		// check if the channel requested to close does exist.
 		ensure!(
@@ -1106,13 +1293,13 @@ impl<T: Config> Pallet<T> {
 		let config = <configuration::Pallet<T>>::config();
 		let notification_bytes = {
 			use parity_scale_codec::Encode as _;
-			use xcm::opaque::{v1::Xcm, VersionedXcm};
+			use xcm::opaque::{latest::prelude::*, VersionedXcm};
 
-			VersionedXcm::from(Xcm::HrmpChannelClosing {
+			VersionedXcm::from(Xcm(vec![HrmpChannelClosing {
 				initiator: u32::from(origin),
 				sender: u32::from(channel_id.sender),
 				recipient: u32::from(channel_id.recipient),
-			})
+			}]))
 			.encode()
 		};
 		let opposite_party =
@@ -1122,6 +1309,10 @@ impl<T: Config> Pallet<T> {
 		{
 			// this should never happen unless the max downward message size is configured to an
 			// jokingly small number.
+			log::error!(
+				target: "runtime::hrmp",
+				"sending 'close_channel::notification_bytes' failed."
+			);
 			debug_assert!(false);
 		}
 
@@ -1167,155 +1358,53 @@ impl<T: Config> Pallet<T> {
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::mock::{
-		new_test_ext, Configuration, Event as MockEvent, Hrmp, MockGenesisConfig, Paras,
-		ParasShared, System, Test,
-	};
-	use frame_support::{assert_noop, assert_ok, traits::Currency as _};
-	use primitives::v1::BlockNumber;
-	use std::collections::{BTreeMap, HashSet};
-
-	fn run_to_block(to: BlockNumber, new_session: Option<Vec<BlockNumber>>) {
-		let config = Configuration::config();
-		while System::block_number() < to {
-			let b = System::block_number();
-
-			// NOTE: this is in reverse initialization order.
-			Hrmp::initializer_finalize();
-			Paras::initializer_finalize();
-			ParasShared::initializer_finalize();
-
-			if new_session.as_ref().map_or(false, |v| v.contains(&(b + 1))) {
-				let notification = crate::initializer::SessionChangeNotification {
-					prev_config: config.clone(),
-					new_config: config.clone(),
-					session_index: ParasShared::session_index() + 1,
-					..Default::default()
-				};
-
-				// NOTE: this is in initialization order.
-				ParasShared::initializer_on_new_session(
-					notification.session_index,
-					notification.random_seed,
-					&notification.new_config,
-					notification.validators.clone(),
-				);
-				let outgoing_paras = Paras::initializer_on_new_session(&notification);
-				Hrmp::initializer_on_new_session(&notification, &outgoing_paras);
-			}
-
-			System::on_finalize(b);
-
-			System::on_initialize(b + 1);
-			System::set_block_number(b + 1);
-
-			// NOTE: this is in initialization order.
-			ParasShared::initializer_initialize(b + 1);
-			Paras::initializer_initialize(b + 1);
-			Hrmp::initializer_initialize(b + 1);
-		}
+impl<T: Config> Pallet<T> {
+	/// Decreases the open channel request count for the given sender. If the value reaches zero
+	/// it is removed completely.
+	fn decrease_open_channel_request_count(sender: ParaId) {
+		<Self as Store>::HrmpOpenChannelRequestCount::mutate_exists(&sender, |opt_rc| {
+			*opt_rc = opt_rc.and_then(|rc| match rc.saturating_sub(1) {
+				0 => None,
+				n => Some(n),
+			});
+		});
 	}
 
-	#[derive(Debug)]
-	struct GenesisConfigBuilder {
-		hrmp_channel_max_capacity: u32,
-		hrmp_channel_max_message_size: u32,
-		hrmp_max_parathread_outbound_channels: u32,
-		hrmp_max_parachain_outbound_channels: u32,
-		hrmp_max_parathread_inbound_channels: u32,
-		hrmp_max_parachain_inbound_channels: u32,
-		hrmp_max_message_num_per_candidate: u32,
-		hrmp_channel_max_total_size: u32,
-		hrmp_sender_deposit: Balance,
-		hrmp_recipient_deposit: Balance,
-		hrmp_open_request_ttl: u32,
+	/// Decreases the accepted channel request count for the given sender. If the value reaches
+	/// zero it is removed completely.
+	fn decrease_accepted_channel_request_count(recipient: ParaId) {
+		<Self as Store>::HrmpAcceptedChannelRequestCount::mutate_exists(&recipient, |opt_rc| {
+			*opt_rc = opt_rc.and_then(|rc| match rc.saturating_sub(1) {
+				0 => None,
+				n => Some(n),
+			});
+		});
 	}
 
-	impl Default for GenesisConfigBuilder {
-		fn default() -> Self {
-			Self {
-				hrmp_channel_max_capacity: 2,
-				hrmp_channel_max_message_size: 8,
-				hrmp_max_parathread_outbound_channels: 1,
-				hrmp_max_parachain_outbound_channels: 2,
-				hrmp_max_parathread_inbound_channels: 1,
-				hrmp_max_parachain_inbound_channels: 2,
-				hrmp_max_message_num_per_candidate: 2,
-				hrmp_channel_max_total_size: 16,
-				hrmp_sender_deposit: 100,
-				hrmp_recipient_deposit: 100,
-				hrmp_open_request_ttl: 3,
-			}
-		}
-	}
-
-	impl GenesisConfigBuilder {
-		fn build(self) -> crate::mock::MockGenesisConfig {
-			let mut genesis = default_genesis_config();
-			let config = &mut genesis.configuration.config;
-			config.hrmp_channel_max_capacity = self.hrmp_channel_max_capacity;
-			config.hrmp_channel_max_message_size = self.hrmp_channel_max_message_size;
-			config.hrmp_max_parathread_outbound_channels =
-				self.hrmp_max_parathread_outbound_channels;
-			config.hrmp_max_parachain_outbound_channels = self.hrmp_max_parachain_outbound_channels;
-			config.hrmp_max_parathread_inbound_channels = self.hrmp_max_parathread_inbound_channels;
-			config.hrmp_max_parachain_inbound_channels = self.hrmp_max_parachain_inbound_channels;
-			config.hrmp_max_message_num_per_candidate = self.hrmp_max_message_num_per_candidate;
-			config.hrmp_channel_max_total_size = self.hrmp_channel_max_total_size;
-			config.hrmp_sender_deposit = self.hrmp_sender_deposit;
-			config.hrmp_recipient_deposit = self.hrmp_recipient_deposit;
-			config.hrmp_open_request_ttl = self.hrmp_open_request_ttl;
-			genesis
-		}
-	}
-
-	fn default_genesis_config() -> MockGenesisConfig {
-		MockGenesisConfig {
-			configuration: crate::configuration::GenesisConfig {
-				config: crate::configuration::HostConfiguration {
-					max_downward_message_size: 1024,
-					..Default::default()
-				},
-			},
-			..Default::default()
-		}
-	}
-
-	fn register_parachain_with_balance(id: ParaId, balance: Balance) {
-		assert_ok!(Paras::schedule_para_initialize(
-			id,
-			crate::paras::ParaGenesisArgs {
-				parachain: true,
-				genesis_head: vec![1].into(),
-				validation_code: vec![1].into(),
-			},
-		));
-		<Test as Config>::Currency::make_free_balance_be(&id.into_account(), balance);
-	}
-
-	fn register_parachain(id: ParaId) {
-		register_parachain_with_balance(id, 1000);
-	}
-
-	fn deregister_parachain(id: ParaId) {
-		assert_ok!(Paras::schedule_para_cleanup(id));
-	}
-
-	fn channel_exists(sender: ParaId, recipient: ParaId) -> bool {
-		<Hrmp as Store>::HrmpChannels::get(&HrmpChannelId { sender, recipient }).is_some()
-	}
-
+	#[cfg(any(feature = "runtime-benchmarks", test))]
 	fn assert_storage_consistency_exhaustive() {
+		fn assert_is_sorted<T: Ord>(slice: &[T], id: &str) {
+			assert!(slice.windows(2).all(|xs| xs[0] <= xs[1]), "{} supposed to be sorted", id);
+		}
+
+		let assert_contains_only_onboarded = |paras: Vec<ParaId>, cause: &str| {
+			for para in paras {
+				assert!(
+					crate::paras::Pallet::<T>::is_valid_para(para),
+					"{}: {:?} para is offboarded",
+					cause,
+					para
+				);
+			}
+		};
+
 		assert_eq!(
-			<Hrmp as Store>::HrmpOpenChannelRequests::iter()
+			<Self as Store>::HrmpOpenChannelRequests::iter()
 				.map(|(k, _)| k)
-				.collect::<HashSet<_>>(),
-			<Hrmp as Store>::HrmpOpenChannelRequestsList::get()
+				.collect::<BTreeSet<_>>(),
+			<Self as Store>::HrmpOpenChannelRequestsList::get()
 				.into_iter()
-				.collect::<HashSet<_>>(),
+				.collect::<BTreeSet<_>>(),
 		);
 
 		// verify that the set of keys in `HrmpOpenChannelRequestCount` corresponds to the set
@@ -1323,17 +1412,17 @@ mod tests {
 		//
 		// having ensured that, we can go ahead and go over all counts and verify that they match.
 		assert_eq!(
-			<Hrmp as Store>::HrmpOpenChannelRequestCount::iter()
+			<Self as Store>::HrmpOpenChannelRequestCount::iter()
 				.map(|(k, _)| k)
-				.collect::<HashSet<_>>(),
-			<Hrmp as Store>::HrmpOpenChannelRequests::iter()
+				.collect::<BTreeSet<_>>(),
+			<Self as Store>::HrmpOpenChannelRequests::iter()
 				.map(|(k, _)| k.sender)
-				.collect::<HashSet<_>>(),
+				.collect::<BTreeSet<_>>(),
 		);
 		for (open_channel_initiator, expected_num) in
-			<Hrmp as Store>::HrmpOpenChannelRequestCount::iter()
+			<Self as Store>::HrmpOpenChannelRequestCount::iter()
 		{
-			let actual_num = <Hrmp as Store>::HrmpOpenChannelRequests::iter()
+			let actual_num = <Self as Store>::HrmpOpenChannelRequests::iter()
 				.filter(|(ch, _)| ch.sender == open_channel_initiator)
 				.count() as u32;
 			assert_eq!(expected_num, actual_num);
@@ -1342,43 +1431,43 @@ mod tests {
 		// The same as above, but for accepted channel request count. Note that we are interested
 		// only in confirmed open requests.
 		assert_eq!(
-			<Hrmp as Store>::HrmpAcceptedChannelRequestCount::iter()
+			<Self as Store>::HrmpAcceptedChannelRequestCount::iter()
 				.map(|(k, _)| k)
-				.collect::<HashSet<_>>(),
-			<Hrmp as Store>::HrmpOpenChannelRequests::iter()
+				.collect::<BTreeSet<_>>(),
+			<Self as Store>::HrmpOpenChannelRequests::iter()
 				.filter(|(_, v)| v.confirmed)
 				.map(|(k, _)| k.recipient)
-				.collect::<HashSet<_>>(),
+				.collect::<BTreeSet<_>>(),
 		);
 		for (channel_recipient, expected_num) in
-			<Hrmp as Store>::HrmpAcceptedChannelRequestCount::iter()
+			<Self as Store>::HrmpAcceptedChannelRequestCount::iter()
 		{
-			let actual_num = <Hrmp as Store>::HrmpOpenChannelRequests::iter()
+			let actual_num = <Self as Store>::HrmpOpenChannelRequests::iter()
 				.filter(|(ch, v)| ch.recipient == channel_recipient && v.confirmed)
 				.count() as u32;
 			assert_eq!(expected_num, actual_num);
 		}
 
 		assert_eq!(
-			<Hrmp as Store>::HrmpCloseChannelRequests::iter()
+			<Self as Store>::HrmpCloseChannelRequests::iter()
 				.map(|(k, _)| k)
-				.collect::<HashSet<_>>(),
-			<Hrmp as Store>::HrmpCloseChannelRequestsList::get()
+				.collect::<BTreeSet<_>>(),
+			<Self as Store>::HrmpCloseChannelRequestsList::get()
 				.into_iter()
-				.collect::<HashSet<_>>(),
+				.collect::<BTreeSet<_>>(),
 		);
 
 		// A HRMP watermark can be None for an onboarded parachain. However, an offboarded parachain
 		// cannot have an HRMP watermark: it should've been cleanup.
 		assert_contains_only_onboarded(
-			<Hrmp as Store>::HrmpWatermarks::iter().map(|(k, _)| k),
+			<Self as Store>::HrmpWatermarks::iter().map(|(k, _)| k).collect::<Vec<_>>(),
 			"HRMP watermarks should contain only onboarded paras",
 		);
 
 		// An entry in `HrmpChannels` indicates that the channel is open. Only open channels can
 		// have contents.
-		for (non_empty_channel, contents) in <Hrmp as Store>::HrmpChannelContents::iter() {
-			assert!(<Hrmp as Store>::HrmpChannels::contains_key(&non_empty_channel));
+		for (non_empty_channel, contents) in <Self as Store>::HrmpChannelContents::iter() {
+			assert!(<Self as Store>::HrmpChannels::contains_key(&non_empty_channel));
 
 			// pedantic check: there should be no empty vectors in storage, those should be modeled
 			// by a removed kv pair.
@@ -1388,7 +1477,9 @@ mod tests {
 		// Senders and recipients must be onboarded. Otherwise, all channels associated with them
 		// are removed.
 		assert_contains_only_onboarded(
-			<Hrmp as Store>::HrmpChannels::iter().flat_map(|(k, _)| vec![k.sender, k.recipient]),
+			<Self as Store>::HrmpChannels::iter()
+				.flat_map(|(k, _)| vec![k.sender, k.recipient])
+				.collect::<Vec<_>>(),
 			"senders and recipients in all channels should be onboarded",
 		);
 
@@ -1411,30 +1502,30 @@ mod tests {
 		//   (b, z)         (b, z)
 		//
 		// and then that we compare that to the channel list in the `HrmpChannels`.
-		let channel_set_derived_from_ingress = <Hrmp as Store>::HrmpIngressChannelsIndex::iter()
+		let channel_set_derived_from_ingress = <Self as Store>::HrmpIngressChannelsIndex::iter()
 			.flat_map(|(p, v)| v.into_iter().map(|i| (i, p)).collect::<Vec<_>>())
-			.collect::<HashSet<_>>();
-		let channel_set_derived_from_egress = <Hrmp as Store>::HrmpEgressChannelsIndex::iter()
+			.collect::<BTreeSet<_>>();
+		let channel_set_derived_from_egress = <Self as Store>::HrmpEgressChannelsIndex::iter()
 			.flat_map(|(p, v)| v.into_iter().map(|e| (p, e)).collect::<Vec<_>>())
-			.collect::<HashSet<_>>();
-		let channel_set_ground_truth = <Hrmp as Store>::HrmpChannels::iter()
+			.collect::<BTreeSet<_>>();
+		let channel_set_ground_truth = <Self as Store>::HrmpChannels::iter()
 			.map(|(k, _)| (k.sender, k.recipient))
-			.collect::<HashSet<_>>();
+			.collect::<BTreeSet<_>>();
 		assert_eq!(channel_set_derived_from_ingress, channel_set_derived_from_egress);
 		assert_eq!(channel_set_derived_from_egress, channel_set_ground_truth);
 
-		<Hrmp as Store>::HrmpIngressChannelsIndex::iter()
+		<Self as Store>::HrmpIngressChannelsIndex::iter()
 			.map(|(_, v)| v)
 			.for_each(|v| assert_is_sorted(&v, "HrmpIngressChannelsIndex"));
-		<Hrmp as Store>::HrmpEgressChannelsIndex::iter()
+		<Self as Store>::HrmpEgressChannelsIndex::iter()
 			.map(|(_, v)| v)
 			.for_each(|v| assert_is_sorted(&v, "HrmpIngressChannelsIndex"));
 
 		assert_contains_only_onboarded(
-			<Hrmp as Store>::HrmpChannelDigests::iter().map(|(k, _)| k),
+			<Self as Store>::HrmpChannelDigests::iter().map(|(k, _)| k).collect::<Vec<_>>(),
 			"HRMP channel digests should contain only onboarded paras",
 		);
-		for (_digest_for_para, digest) in <Hrmp as Store>::HrmpChannelDigests::iter() {
+		for (_digest_for_para, digest) in <Self as Store>::HrmpChannelDigests::iter() {
 			// Assert that items are in **strictly** ascending order. The strictness also implies
 			// there are no duplicates.
 			assert!(digest.windows(2).all(|xs| xs[0].0 < xs[1].0));
@@ -1453,431 +1544,5 @@ mod tests {
 				);
 			}
 		}
-
-		fn assert_contains_only_onboarded(iter: impl Iterator<Item = ParaId>, cause: &str) {
-			for para in iter {
-				assert!(Paras::is_valid_para(para), "{}: {} para is offboarded", cause, para);
-			}
-		}
-	}
-
-	fn assert_is_sorted<T: Ord>(slice: &[T], id: &str) {
-		assert!(slice.windows(2).all(|xs| xs[0] <= xs[1]), "{} supposed to be sorted", id);
-	}
-
-	#[test]
-	fn empty_state_consistent_state() {
-		new_test_ext(GenesisConfigBuilder::default().build()).execute_with(|| {
-			assert_storage_consistency_exhaustive();
-		});
-	}
-
-	#[test]
-	fn open_channel_works() {
-		let para_a = 1.into();
-		let para_a_origin: crate::Origin = 1.into();
-		let para_b = 3.into();
-		let para_b_origin: crate::Origin = 3.into();
-
-		new_test_ext(GenesisConfigBuilder::default().build()).execute_with(|| {
-			// We need both A & B to be registered and alive parachains.
-			register_parachain(para_a);
-			register_parachain(para_b);
-
-			run_to_block(5, Some(vec![4, 5]));
-			Hrmp::hrmp_init_open_channel(para_a_origin.into(), para_b, 2, 8).unwrap();
-			assert_storage_consistency_exhaustive();
-			assert!(System::events().iter().any(|record| record.event ==
-				MockEvent::Hrmp(Event::OpenChannelRequested(para_a, para_b, 2, 8))));
-
-			Hrmp::hrmp_accept_open_channel(para_b_origin.into(), para_a).unwrap();
-			assert_storage_consistency_exhaustive();
-			assert!(System::events().iter().any(|record| record.event ==
-				MockEvent::Hrmp(Event::OpenChannelAccepted(para_a, para_b))));
-
-			// Advance to a block 6, but without session change. That means that the channel has
-			// not been created yet.
-			run_to_block(6, None);
-			assert!(!channel_exists(para_a, para_b));
-			assert_storage_consistency_exhaustive();
-
-			// Now let the session change happen and thus open the channel.
-			run_to_block(8, Some(vec![8]));
-			assert!(channel_exists(para_a, para_b));
-		});
-	}
-
-	#[test]
-	fn close_channel_works() {
-		let para_a = 5.into();
-		let para_b = 2.into();
-		let para_b_origin: crate::Origin = 2.into();
-
-		new_test_ext(GenesisConfigBuilder::default().build()).execute_with(|| {
-			register_parachain(para_a);
-			register_parachain(para_b);
-
-			run_to_block(5, Some(vec![4, 5]));
-			Hrmp::init_open_channel(para_a, para_b, 2, 8).unwrap();
-			Hrmp::accept_open_channel(para_b, para_a).unwrap();
-
-			run_to_block(6, Some(vec![6]));
-			assert!(channel_exists(para_a, para_b));
-
-			// Close the channel. The effect is not immediate, but rather deferred to the next
-			// session change.
-			let channel_id = HrmpChannelId { sender: para_a, recipient: para_b };
-			Hrmp::hrmp_close_channel(para_b_origin.into(), channel_id.clone()).unwrap();
-			assert!(channel_exists(para_a, para_b));
-			assert_storage_consistency_exhaustive();
-
-			// After the session change the channel should be closed.
-			run_to_block(8, Some(vec![8]));
-			assert!(!channel_exists(para_a, para_b));
-			assert_storage_consistency_exhaustive();
-			assert!(System::events().iter().any(|record| record.event ==
-				MockEvent::Hrmp(Event::ChannelClosed(para_b, channel_id.clone()))));
-		});
-	}
-
-	#[test]
-	fn send_recv_messages() {
-		let para_a = 32.into();
-		let para_b = 64.into();
-
-		let mut genesis = GenesisConfigBuilder::default();
-		genesis.hrmp_channel_max_message_size = 20;
-		genesis.hrmp_channel_max_total_size = 20;
-		new_test_ext(genesis.build()).execute_with(|| {
-			register_parachain(para_a);
-			register_parachain(para_b);
-
-			run_to_block(5, Some(vec![4, 5]));
-			Hrmp::init_open_channel(para_a, para_b, 2, 20).unwrap();
-			Hrmp::accept_open_channel(para_b, para_a).unwrap();
-
-			// On Block 6:
-			// A sends a message to B
-			run_to_block(6, Some(vec![6]));
-			assert!(channel_exists(para_a, para_b));
-			let msgs = vec![OutboundHrmpMessage {
-				recipient: para_b,
-				data: b"this is an emergency".to_vec(),
-			}];
-			let config = Configuration::config();
-			assert!(Hrmp::check_outbound_hrmp(&config, para_a, &msgs).is_ok());
-			let _ = Hrmp::queue_outbound_hrmp(para_a, msgs);
-			assert_storage_consistency_exhaustive();
-
-			// On Block 7:
-			// B receives the message sent by A. B sets the watermark to 6.
-			run_to_block(7, None);
-			assert!(Hrmp::check_hrmp_watermark(para_b, 7, 6).is_ok());
-			let _ = Hrmp::prune_hrmp(para_b, 6);
-			assert_storage_consistency_exhaustive();
-		});
-	}
-
-	#[test]
-	fn hrmp_mqc_head_fixture() {
-		let para_a = 2000.into();
-		let para_b = 2024.into();
-
-		let mut genesis = GenesisConfigBuilder::default();
-		genesis.hrmp_channel_max_message_size = 20;
-		genesis.hrmp_channel_max_total_size = 20;
-		new_test_ext(genesis.build()).execute_with(|| {
-			register_parachain(para_a);
-			register_parachain(para_b);
-
-			run_to_block(2, Some(vec![1, 2]));
-			Hrmp::init_open_channel(para_a, para_b, 2, 20).unwrap();
-			Hrmp::accept_open_channel(para_b, para_a).unwrap();
-
-			run_to_block(3, Some(vec![3]));
-			let _ = Hrmp::queue_outbound_hrmp(
-				para_a,
-				vec![OutboundHrmpMessage { recipient: para_b, data: vec![1, 2, 3] }],
-			);
-
-			run_to_block(4, None);
-			let _ = Hrmp::queue_outbound_hrmp(
-				para_a,
-				vec![OutboundHrmpMessage { recipient: para_b, data: vec![4, 5, 6] }],
-			);
-
-			assert_eq!(
-				Hrmp::hrmp_mqc_heads(para_b),
-				vec![(
-					para_a,
-					hex_literal::hex![
-						"a964fd3b4f3d3ce92a0e25e576b87590d92bb5cb7031909c7f29050e1f04a375"
-					]
-					.into()
-				),],
-			);
-		});
-	}
-
-	#[test]
-	fn accept_incoming_request_and_offboard() {
-		let para_a = 32.into();
-		let para_b = 64.into();
-
-		new_test_ext(GenesisConfigBuilder::default().build()).execute_with(|| {
-			register_parachain(para_a);
-			register_parachain(para_b);
-
-			run_to_block(5, Some(vec![4, 5]));
-			Hrmp::init_open_channel(para_a, para_b, 2, 8).unwrap();
-			Hrmp::accept_open_channel(para_b, para_a).unwrap();
-			deregister_parachain(para_a);
-
-			// On Block 7: 2x session change. The channel should not be created.
-			run_to_block(7, Some(vec![6, 7]));
-			assert!(!Paras::is_valid_para(para_a));
-			assert!(!channel_exists(para_a, para_b));
-			assert_storage_consistency_exhaustive();
-		});
-	}
-
-	#[test]
-	fn check_sent_messages() {
-		let para_a = 32.into();
-		let para_b = 64.into();
-		let para_c = 97.into();
-
-		new_test_ext(GenesisConfigBuilder::default().build()).execute_with(|| {
-			register_parachain(para_a);
-			register_parachain(para_b);
-			register_parachain(para_c);
-
-			run_to_block(5, Some(vec![4, 5]));
-
-			// Open two channels to the same receiver, b:
-			// a -> b, c -> b
-			Hrmp::init_open_channel(para_a, para_b, 2, 8).unwrap();
-			Hrmp::accept_open_channel(para_b, para_a).unwrap();
-			Hrmp::init_open_channel(para_c, para_b, 2, 8).unwrap();
-			Hrmp::accept_open_channel(para_b, para_c).unwrap();
-
-			// On Block 6: session change.
-			run_to_block(6, Some(vec![6]));
-			assert!(Paras::is_valid_para(para_a));
-
-			let msgs = vec![OutboundHrmpMessage { recipient: para_b, data: b"knock".to_vec() }];
-			let config = Configuration::config();
-			assert!(Hrmp::check_outbound_hrmp(&config, para_a, &msgs).is_ok());
-			let _ = Hrmp::queue_outbound_hrmp(para_a, msgs.clone());
-
-			// Verify that the sent messages are there and that also the empty channels are present.
-			let mqc_heads = Hrmp::hrmp_mqc_heads(para_b);
-			let contents = Hrmp::inbound_hrmp_channels_contents(para_b);
-			assert_eq!(
-				contents,
-				vec![
-					(para_a, vec![InboundHrmpMessage { sent_at: 6, data: b"knock".to_vec() }]),
-					(para_c, vec![])
-				]
-				.into_iter()
-				.collect::<BTreeMap::<_, _>>(),
-			);
-			assert_eq!(
-				mqc_heads,
-				vec![
-					(
-						para_a,
-						hex_literal::hex!(
-							"3bba6404e59c91f51deb2ae78f1273ebe75896850713e13f8c0eba4b0996c483"
-						)
-						.into()
-					),
-					(para_c, Default::default())
-				],
-			);
-
-			assert_storage_consistency_exhaustive();
-		});
-	}
-
-	#[test]
-	fn verify_externally_accessible() {
-		use primitives::v1::{well_known_keys, AbridgedHrmpChannel};
-
-		let para_a = 20.into();
-		let para_b = 21.into();
-
-		new_test_ext(GenesisConfigBuilder::default().build()).execute_with(|| {
-			// Register two parachains, wait until a session change, then initiate channel open
-			// request and accept that, and finally wait until the next session.
-			register_parachain(para_a);
-			register_parachain(para_b);
-			run_to_block(5, Some(vec![4, 5]));
-			Hrmp::init_open_channel(para_a, para_b, 2, 8).unwrap();
-			Hrmp::accept_open_channel(para_b, para_a).unwrap();
-			run_to_block(8, Some(vec![8]));
-
-			// Here we have a channel a->b opened.
-			//
-			// Try to obtain this channel from the storage and
-			// decode it into the abridged version.
-			assert!(channel_exists(para_a, para_b));
-			let raw_hrmp_channel =
-				sp_io::storage::get(&well_known_keys::hrmp_channels(HrmpChannelId {
-					sender: para_a,
-					recipient: para_b,
-				}))
-				.expect("the channel exists and we must be able to get it through well known keys");
-			let abridged_hrmp_channel = AbridgedHrmpChannel::decode(&mut &raw_hrmp_channel[..])
-				.expect("HrmpChannel should be decodable as AbridgedHrmpChannel");
-
-			assert_eq!(
-				abridged_hrmp_channel,
-				AbridgedHrmpChannel {
-					max_capacity: 2,
-					max_total_size: 16,
-					max_message_size: 8,
-					msg_count: 0,
-					total_size: 0,
-					mqc_head: None,
-				},
-			);
-
-			let raw_ingress_index =
-				sp_io::storage::get(&well_known_keys::hrmp_ingress_channel_index(para_b))
-					.expect("the ingress index must be present for para_b");
-			let ingress_index = <Vec<ParaId>>::decode(&mut &raw_ingress_index[..])
-				.expect("ingress indexx should be decodable as a list of para ids");
-			assert_eq!(ingress_index, vec![para_a]);
-
-			// Now, verify that we can access and decode the egress index.
-			let raw_egress_index =
-				sp_io::storage::get(&well_known_keys::hrmp_egress_channel_index(para_a))
-					.expect("the egress index must be present for para_a");
-			let egress_index = <Vec<ParaId>>::decode(&mut &raw_egress_index[..])
-				.expect("egress index should be decodable as a list of para ids");
-			assert_eq!(egress_index, vec![para_b]);
-		});
-	}
-
-	#[test]
-	fn charging_deposits() {
-		let para_a = 32.into();
-		let para_b = 64.into();
-
-		new_test_ext(GenesisConfigBuilder::default().build()).execute_with(|| {
-			register_parachain_with_balance(para_a, 0);
-			register_parachain(para_b);
-			run_to_block(5, Some(vec![4, 5]));
-
-			assert_noop!(
-				Hrmp::init_open_channel(para_a, para_b, 2, 8),
-				pallet_balances::Error::<Test, _>::InsufficientBalance
-			);
-		});
-
-		new_test_ext(GenesisConfigBuilder::default().build()).execute_with(|| {
-			register_parachain(para_a);
-			register_parachain_with_balance(para_b, 0);
-			run_to_block(5, Some(vec![4, 5]));
-
-			Hrmp::init_open_channel(para_a, para_b, 2, 8).unwrap();
-
-			assert_noop!(
-				Hrmp::accept_open_channel(para_b, para_a),
-				pallet_balances::Error::<Test, _>::InsufficientBalance
-			);
-		});
-	}
-
-	#[test]
-	fn refund_deposit_on_normal_closure() {
-		let para_a = 32.into();
-		let para_b = 64.into();
-
-		let mut genesis = GenesisConfigBuilder::default();
-		genesis.hrmp_sender_deposit = 20;
-		genesis.hrmp_recipient_deposit = 15;
-		new_test_ext(genesis.build()).execute_with(|| {
-			// Register two parachains funded with different amounts of funds and arrange a channel.
-			register_parachain_with_balance(para_a, 100);
-			register_parachain_with_balance(para_b, 110);
-			run_to_block(5, Some(vec![4, 5]));
-			Hrmp::init_open_channel(para_a, para_b, 2, 8).unwrap();
-			Hrmp::accept_open_channel(para_b, para_a).unwrap();
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_a.into_account()), 80);
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_b.into_account()), 95);
-			run_to_block(8, Some(vec![8]));
-
-			// Now, we close the channel and wait until the next session.
-			Hrmp::close_channel(para_b, HrmpChannelId { sender: para_a, recipient: para_b })
-				.unwrap();
-			run_to_block(10, Some(vec![10]));
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_a.into_account()), 100);
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_b.into_account()), 110);
-		});
-	}
-
-	#[test]
-	fn refund_deposit_on_request_expiry() {
-		let para_a = 32.into();
-		let para_b = 64.into();
-
-		let mut genesis = GenesisConfigBuilder::default();
-		genesis.hrmp_sender_deposit = 20;
-		genesis.hrmp_recipient_deposit = 15;
-		genesis.hrmp_open_request_ttl = 2;
-		new_test_ext(genesis.build()).execute_with(|| {
-			// Register two parachains funded with different amounts of funds, send an open channel
-			// request but do not accept it.
-			register_parachain_with_balance(para_a, 100);
-			register_parachain_with_balance(para_b, 110);
-			run_to_block(5, Some(vec![4, 5]));
-			Hrmp::init_open_channel(para_a, para_b, 2, 8).unwrap();
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_a.into_account()), 80);
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_b.into_account()), 110);
-
-			// Request age is 1 out of 2
-			run_to_block(10, Some(vec![10]));
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_a.into_account()), 80);
-
-			// Request age is 2 out of 2. The request should expire.
-			run_to_block(20, Some(vec![20]));
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_a.into_account()), 100);
-		});
-	}
-
-	#[test]
-	fn refund_deposit_on_offboarding() {
-		let para_a = 32.into();
-		let para_b = 64.into();
-
-		let mut genesis = GenesisConfigBuilder::default();
-		genesis.hrmp_sender_deposit = 20;
-		genesis.hrmp_recipient_deposit = 15;
-		new_test_ext(genesis.build()).execute_with(|| {
-			// Register two parachains and open a channel between them.
-			register_parachain_with_balance(para_a, 100);
-			register_parachain_with_balance(para_b, 110);
-			run_to_block(5, Some(vec![4, 5]));
-			Hrmp::init_open_channel(para_a, para_b, 2, 8).unwrap();
-			Hrmp::accept_open_channel(para_b, para_a).unwrap();
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_a.into_account()), 80);
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_b.into_account()), 95);
-			run_to_block(8, Some(vec![8]));
-			assert!(channel_exists(para_a, para_b));
-
-			// Then deregister one parachain.
-			deregister_parachain(para_a);
-			run_to_block(10, Some(vec![9, 10]));
-
-			// The channel should be removed.
-			assert!(!Paras::is_valid_para(para_a));
-			assert!(!channel_exists(para_a, para_b));
-			assert_storage_consistency_exhaustive();
-
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_a.into_account()), 100);
-			assert_eq!(<Test as Config>::Currency::free_balance(&para_b.into_account()), 110);
-		});
 	}
 }

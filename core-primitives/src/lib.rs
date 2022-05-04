@@ -23,6 +23,7 @@
 use parity_scale_codec::{Decode, Encode};
 #[cfg(feature = "std")]
 use parity_util_mem::MallocSizeOf;
+use scale_info::TypeInfo;
 use sp_runtime::{
 	generic,
 	traits::{IdentifyAccount, Verify},
@@ -64,9 +65,17 @@ pub type Hash = sp_core::H256;
 /// This type is produced by [`CandidateReceipt::hash`].
 ///
 /// This type makes it easy to enforce that a hash is a candidate hash on the type level.
-#[derive(Clone, Copy, Encode, Decode, Hash, Eq, PartialEq, Default, PartialOrd, Ord)]
+#[derive(Clone, Copy, Encode, Decode, Hash, Eq, PartialEq, Default, PartialOrd, Ord, TypeInfo)]
 #[cfg_attr(feature = "std", derive(MallocSizeOf))]
 pub struct CandidateHash(pub Hash);
+
+#[cfg(feature = "std")]
+impl std::ops::Deref for CandidateHash {
+	type Target = Hash;
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
 
 #[cfg(feature = "std")]
 impl std::fmt::Display for CandidateHash {
@@ -117,17 +126,17 @@ pub type DownwardMessage = sp_std::vec::Vec<u8>;
 
 /// A wrapped version of `DownwardMessage`. The difference is that it has attached the block number when
 /// the message was sent.
-#[derive(Encode, Decode, Clone, sp_runtime::RuntimeDebug, PartialEq)]
+#[derive(Encode, Decode, Clone, sp_runtime::RuntimeDebug, PartialEq, TypeInfo)]
 #[cfg_attr(feature = "std", derive(MallocSizeOf))]
 pub struct InboundDownwardMessage<BlockNumber = crate::BlockNumber> {
-	/// The block number at which this messages was put into the downward message queue.
+	/// The block number at which these messages were put into the downward message queue.
 	pub sent_at: BlockNumber,
 	/// The actual downward message to processes.
 	pub msg: DownwardMessage,
 }
 
 /// An HRMP message seen from the perspective of a recipient.
-#[derive(Encode, Decode, Clone, sp_runtime::RuntimeDebug, PartialEq)]
+#[derive(Encode, Decode, Clone, sp_runtime::RuntimeDebug, PartialEq, TypeInfo)]
 #[cfg_attr(feature = "std", derive(MallocSizeOf))]
 pub struct InboundHrmpMessage<BlockNumber = crate::BlockNumber> {
 	/// The block number at which this message was sent.
@@ -139,7 +148,7 @@ pub struct InboundHrmpMessage<BlockNumber = crate::BlockNumber> {
 }
 
 /// An HRMP message seen from the perspective of a sender.
-#[derive(Encode, Decode, Clone, sp_runtime::RuntimeDebug, PartialEq, Eq, Hash)]
+#[derive(Encode, Decode, Clone, sp_runtime::RuntimeDebug, PartialEq, Eq, Hash, TypeInfo)]
 #[cfg_attr(feature = "std", derive(MallocSizeOf))]
 pub struct OutboundHrmpMessage<Id> {
 	/// The para that will get this message in its downward message queue.
@@ -148,7 +157,7 @@ pub struct OutboundHrmpMessage<Id> {
 	pub data: sp_std::vec::Vec<u8>,
 }
 
-/// `V1` primitives.
-pub mod v1 {
+/// `V2` primitives.
+pub mod v2 {
 	pub use super::*;
 }

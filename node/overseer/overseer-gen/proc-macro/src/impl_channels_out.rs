@@ -56,6 +56,8 @@ pub(crate) fn impl_channels_out_struct(info: &OverseerInfo) -> Result<proc_macro
 			)*
 		}
 
+		#[allow(unreachable_code)]
+		// when no defined messages in enum
 		impl ChannelsOut {
 			/// Send a message via a bounded channel.
 			pub async fn send_and_log_error(
@@ -80,7 +82,7 @@ pub(crate) fn impl_channels_out_struct(info: &OverseerInfo) -> Result<proc_macro
 				};
 
 				if let Err(subsystem_name) = res {
-					#support_crate ::tracing::debug!(
+					#support_crate ::gum::debug!(
 						target: LOG_TARGET,
 						"Failed to send (bounded) a message to {} subsystem",
 						subsystem_name
@@ -94,8 +96,6 @@ pub(crate) fn impl_channels_out_struct(info: &OverseerInfo) -> Result<proc_macro
 				signals_received: usize,
 				message: #message_wrapper,
 			) {
-				use ::std::sync::mpsc::TrySendError;
-
 				let res: ::std::result::Result<_, _> = match message {
 				#(
 					#message_wrapper :: #consumes_variant (inner) => {
@@ -114,7 +114,7 @@ pub(crate) fn impl_channels_out_struct(info: &OverseerInfo) -> Result<proc_macro
 				};
 
 				if let Err(subsystem_name) = res {
-					#support_crate ::tracing::debug!(
+					#support_crate ::gum::debug!(
 						target: LOG_TARGET,
 						"Failed to send_unbounded a message to {} subsystem",
 						subsystem_name

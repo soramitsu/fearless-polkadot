@@ -17,91 +17,66 @@
 
 //! Error handling related code and Error/Result definitions.
 
-use thiserror::Error;
+use fatality::Nested;
 
-use polkadot_node_network_protocol::{request_response::request::ReceiveError, PeerId};
-use polkadot_node_subsystem_util::{runtime, unwrap_non_fatal, Fault};
+use polkadot_node_network_protocol::{request_response::incoming, PeerId};
+use polkadot_node_subsystem_util::runtime;
 
 use crate::LOG_TARGET;
 
-#[derive(Debug, Error)]
-#[error(transparent)]
-pub struct Error(pub Fault<NonFatal, Fatal>);
-
-impl From<NonFatal> for Error {
-	fn from(e: NonFatal) -> Self {
-		Self(Fault::from_non_fatal(e))
-	}
-}
-
-impl From<Fatal> for Error {
-	fn from(f: Fatal) -> Self {
-		Self(Fault::from_fatal(f))
-	}
-}
-
-impl From<runtime::Error> for Error {
-	fn from(o: runtime::Error) -> Self {
-		Self(Fault::from_other(o))
-	}
-}
-
-/// Fatal errors of this subsystem.
-#[derive(Debug, Error)]
-pub enum Fatal {
-	/// Request channel returned `None`. Likely a system shutdown.
-	#[error("Request channel stream finished.")]
-	RequestChannelFinished,
-
-	/// Errors coming from runtime::Runtime.
+#[allow(missing_docs)]
+#[fatality::fatality(splitable)]
+pub enum Error {
+	#[fatal(forward)]
 	#[error("Error while accessing runtime information")]
-	Runtime(#[from] runtime::Fatal),
-}
+	Runtime(#[from] runtime::Error),
 
-/// Non-fatal errors of this subsystem.
-#[derive(Debug, Error)]
-pub enum NonFatal {
-	/// Answering request failed.
+	#[fatal(forward)]
+	#[error("Retrieving next incoming request failed.")]
+	IncomingRequest(#[from] incoming::Error),
+
 	#[error("Sending back response to peer {0} failed.")]
 	SendResponse(PeerId),
 
-	/// Getting request from raw request failed.
-	#[error("Decoding request failed.")]
-	FromRawRequest(#[source] ReceiveError),
-
-	/// Setting reputation for peer failed.
 	#[error("Changing peer's ({0}) reputation failed.")]
 	SetPeerReputation(PeerId),
 
-	/// Peer sent us request with invalid signature.
 	#[error("Dispute request with invalid signatures, from peer {0}.")]
 	InvalidSignature(PeerId),
 
-	/// Import oneshot got canceled.
 	#[error("Import of dispute got canceled for peer {0} - import failed for some reason.")]
 	ImportCanceled(PeerId),
 
-	/// Non validator tried to participate in dispute.
-	#[error("Peer {0} is not a validator.")]
+	#[error("Peer {0} attempted to participate in dispute and is not a validator.")]
 	NotAValidator(PeerId),
-
-	/// Errors coming from runtime::Runtime.
-	#[error("Error while accessing runtime information")]
-	Runtime(#[from] runtime::NonFatal),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub type FatalResult<T> = std::result::Result<T, Fatal>;
-pub type NonFatalResult<T> = std::result::Result<T, NonFatal>;
+pub type JfyiErrorResult<T> = std::result::Result<T, JfyiError>;
 
 /// Utility for eating top level errors and log them.
 ///
 /// We basically always want to try and continue on error. This utility function is meant to
-/// consume top-level errors by simply logging them
-pub fn log_error(result: Result<()>) -> std::result::Result<(), Fatal> {
-	if let Some(error) = unwrap_non_fatal(result.map_err(|e| e.0))? {
-		tracing::warn!(target: LOG_TARGET, error = ?error);
+/// consume top-level errors by simply logging them.
+pub fn log_error(result: Result<()>) -> std::result::Result<(), FatalError> {
+	match result.into_nested()? {
+		Err(error @ JfyiError::ImportCanceled(_)) => {
+			gum::debug!(target: LOG_TARGET, error = ?error);
+			Ok(())
+		},
+		Err(JfyiError::NotAValidator(peer)) => {
+			gum::debug!(
+				target: LOG_TARGET,
+				?peer,
+				"Dropping message from peer (unknown authority id)"
+			);
+			Ok(())
+		},
+		Err(error) => {
+			gum::warn!(target: LOG_TARGET, error = ?error);
+			Ok(())
+		},
+		Ok(()) => Ok(()),
 	}
-	Ok(())
 }

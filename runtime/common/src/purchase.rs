@@ -23,6 +23,7 @@ use frame_support::{
 use frame_system::pallet_prelude::*;
 pub use pallet::*;
 use parity_scale_codec::{Decode, Encode};
+use scale_info::TypeInfo;
 use sp_core::sr25519;
 use sp_runtime::{
 	traits::{CheckedAdd, Saturating, Verify, Zero},
@@ -33,8 +34,8 @@ use sp_std::prelude::*;
 type BalanceOf<T> =
 	<<T as Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
 
-/// The kind of a statement an account needs to make for a claim to be valid.
-#[derive(Encode, Decode, Clone, Copy, Eq, PartialEq, RuntimeDebug)]
+/// The kind of statement an account needs to make for a claim to be valid.
+#[derive(Encode, Decode, Clone, Copy, Eq, PartialEq, RuntimeDebug, TypeInfo)]
 pub enum AccountValidity {
 	/// Account is not valid.
 	Invalid,
@@ -70,7 +71,7 @@ impl AccountValidity {
 }
 
 /// All information about an account regarding the purchase of DOTs.
-#[derive(Encode, Decode, Default, Clone, Eq, PartialEq, RuntimeDebug)]
+#[derive(Encode, Decode, Default, Clone, Eq, PartialEq, RuntimeDebug, TypeInfo)]
 pub struct AccountStatus<Balance> {
 	/// The current validity status of the user. Will denote if the user has passed KYC,
 	/// how much they are able to purchase, and when their purchase process has completed.
@@ -91,6 +92,7 @@ pub mod pallet {
 
 	#[pallet::pallet]
 	#[pallet::generate_store(pub(super) trait Store)]
+	#[pallet::without_storage_info]
 	pub struct Pallet<T>(_);
 
 	#[pallet::config]
@@ -129,11 +131,6 @@ pub mod pallet {
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
-	#[pallet::metadata(
-		T::AccountId = "AccountId",
-		T::BlockNumber = "BlockNumber",
-		BalanceOf<T> = "Balance",
-	)]
 	pub enum Event<T: Config> {
 		/// A [new] account was created.
 		AccountCreated(T::AccountId),
@@ -178,7 +175,7 @@ pub mod pallet {
 
 	// The account that will be used to payout participants of the DOT purchase process.
 	#[pallet::storage]
-	pub(super) type PaymentAccount<T: Config> = StorageValue<_, T::AccountId, ValueQuery>;
+	pub(super) type PaymentAccount<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
 
 	// The statement purchasers will need to sign to participate.
 	#[pallet::storage]
@@ -294,12 +291,14 @@ pub mod pallet {
 		///
 		/// We reverify all assumptions about the state of an account, and complete the process.
 		///
-		/// Origin must match the configured `PaymentAccount`.
+		/// Origin must match the configured `PaymentAccount` (if it is not configured then this
+		/// will always fail with `BadOrigin`).
 		#[pallet::weight(T::DbWeight::get().reads_writes(4, 2))]
 		pub fn payout(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
 			// Payments must be made directly by the `PaymentAccount`.
 			let payment_account = ensure_signed(origin)?;
-			ensure!(payment_account == PaymentAccount::<T>::get(), DispatchError::BadOrigin);
+			let test_against = PaymentAccount::<T>::get().ok_or(DispatchError::BadOrigin)?;
+			ensure!(payment_account == test_against, DispatchError::BadOrigin);
 
 			// Account should not have a vesting schedule.
 			ensure!(
@@ -367,7 +366,7 @@ pub mod pallet {
 		pub fn set_payment_account(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
 			T::ConfigurationOrigin::ensure_origin(origin)?;
 			// Possibly this is worse than having the caller account be the payment account?
-			PaymentAccount::<T>::set(who.clone());
+			PaymentAccount::<T>::put(who.clone());
 			Self::deposit_event(Event::<T>::PaymentAccountSet(who));
 			Ok(())
 		}
@@ -412,8 +411,9 @@ pub mod pallet {
 impl<T: Config> Pallet<T> {
 	fn verify_signature(who: &T::AccountId, signature: &[u8]) -> Result<(), DispatchError> {
 		// sr25519 always expects a 64 byte signature.
-		ensure!(signature.len() == 64, Error::<T>::InvalidSignature);
-		let signature: AnySignature = sr25519::Signature::from_slice(signature).into();
+		let signature: AnySignature = sr25519::Signature::from_slice(signature)
+			.ok_or(Error::<T>::InvalidSignature)?
+			.into();
 
 		// In Polkadot, the AccountId is always the same as the 32 byte public key.
 		let account_bytes: [u8; 32] = account_to_bytes(who)?;
@@ -520,6 +520,7 @@ mod tests {
 		type SystemWeightInfo = ();
 		type SS58Prefix = ();
 		type OnSetCode = ();
+		type MaxConsumers = frame_support::traits::ConstU32<16>;
 	}
 
 	parameter_types! {
@@ -539,7 +540,7 @@ mod tests {
 	}
 
 	parameter_types! {
-		pub const MinVestedTransfer: u64 = 0;
+		pub const MinVestedTransfer: u64 = 1;
 	}
 
 	impl pallet_vesting::Config for Test {
@@ -548,6 +549,7 @@ mod tests {
 		type BlockNumberToBalance = Identity;
 		type MinVestedTransfer = MinVestedTransfer;
 		type WeightInfo = ();
+		const MAX_VESTING_SCHEDULES: u32 = 28;
 	}
 
 	parameter_types! {
@@ -714,7 +716,7 @@ mod tests {
 				Origin::signed(configuration_origin()),
 				payment_account.clone()
 			));
-			assert_eq!(PaymentAccount::<Test>::get(), payment_account);
+			assert_eq!(PaymentAccount::<Test>::get(), Some(payment_account));
 		});
 	}
 
@@ -1070,7 +1072,7 @@ mod tests {
 			);
 			// Vesting lock is removed in whole on block 101 (100 blocks after block 1)
 			System::set_block_number(100);
-			let vest_call = Call::Vesting(pallet_vesting::Call::<Test>::vest());
+			let vest_call = Call::Vesting(pallet_vesting::Call::<Test>::vest {});
 			assert_ok!(vest_call.clone().dispatch(Origin::signed(alice())));
 			assert_ok!(vest_call.clone().dispatch(Origin::signed(bob())));
 			assert_eq!(<Test as Config>::VestingSchedule::vesting_balance(&alice()), Some(45));

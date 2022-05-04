@@ -17,6 +17,7 @@
 //! Tests for the Westend Runtime Configuration
 
 use crate::*;
+use xcm::latest::{AssetId::*, Fungibility::*, MultiLocation};
 
 #[test]
 fn remove_keys_weight_is_sensible() {
@@ -31,7 +32,8 @@ fn sample_size_is_sensible() {
 	use runtime_common::auctions::WeightInfo;
 	// Need to clean up all samples at the end of an auction.
 	let samples: BlockNumber = EndingPeriod::get() / SampleLength::get();
-	let max_weight: Weight = RocksDbWeight::get().reads_writes(samples.into(), samples.into());
+	let max_weight: frame_support::weights::Weight =
+		RocksDbWeight::get().reads_writes(samples.into(), samples.into());
 	// Max sample cleanup should be no more than half the total block weight.
 	assert!(max_weight * 2 < BlockWeights::get().max_block);
 	assert!(
@@ -48,4 +50,22 @@ fn call_size() {
 		the size of Call.
 		If the limit is too strong, maybe consider increase the limit to 300.",
 	);
+}
+
+#[test]
+fn sanity_check_teleport_assets_weight() {
+	// This test sanity checks that at least 50 teleports can exist in a block.
+	// Usually when XCM runs into an issue, it will return a weight of `Weight::MAX`,
+	// so this test will certainly ensure that this problem does not occur.
+	use frame_support::dispatch::GetDispatchInfo;
+	let weight = pallet_xcm::Call::<Runtime>::teleport_assets {
+		dest: Box::new(xcm::VersionedMultiLocation::V1(MultiLocation::here())),
+		beneficiary: Box::new(xcm::VersionedMultiLocation::V1(MultiLocation::here())),
+		assets: Box::new((Concrete(MultiLocation::here()), Fungible(200_000)).into()),
+		fee_asset_item: 0,
+	}
+	.get_dispatch_info()
+	.weight;
+
+	assert!(weight * 50 < BlockWeights::get().max_block);
 }

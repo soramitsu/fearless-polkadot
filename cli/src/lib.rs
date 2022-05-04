@@ -18,19 +18,22 @@
 
 #![warn(missing_docs)]
 
-#[cfg(feature = "browser")]
-mod browser;
 #[cfg(feature = "cli")]
 mod cli;
 #[cfg(feature = "cli")]
 mod command;
+#[cfg(feature = "cli")]
+mod error;
+#[cfg(all(feature = "cli", build_type = "release"))]
+mod host_perf_check;
 
-pub use service::{
-	self, Block, CoreApi, IdentifyVariant, ProvideRuntimeApi, RuntimeApiCollection, TFullClient,
-};
+#[cfg(feature = "full-node")]
+pub use service::RuntimeApiCollection;
+#[cfg(feature = "service")]
+pub use service::{self, Block, CoreApi, IdentifyVariant, ProvideRuntimeApi, TFullClient};
 
 #[cfg(feature = "malus")]
-pub use service::create_default_subsystems;
+pub use service::overseer::prepared_overseer_builder;
 
 #[cfg(feature = "cli")]
 pub use cli::*;

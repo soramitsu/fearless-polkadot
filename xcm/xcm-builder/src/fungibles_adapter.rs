@@ -55,7 +55,7 @@ impl<Prefix: Get<MultiLocation>, AssetId: Clone, ConvertAssetId: Convert<u128, A
 	fn reverse_ref(what: impl Borrow<AssetId>) -> result::Result<MultiLocation, ()> {
 		let mut location = Prefix::get();
 		let id = ConvertAssetId::reverse_ref(what)?;
-		location.push_interior(Junction::GeneralIndex(id))?;
+		location.push_interior(Junction::GeneralIndex(id)).map_err(|_| ())?;
 		Ok(location)
 	}
 }
@@ -118,11 +118,16 @@ impl<
 		AccountId: Clone, // can't get away without it since Currency is generic over it.
 	> TransactAsset for FungiblesTransferAdapter<Assets, Matcher, AccountIdConverter, AccountId>
 {
-	fn transfer_asset(
+	fn internal_transfer_asset(
 		what: &MultiAsset,
 		from: &MultiLocation,
 		to: &MultiLocation,
 	) -> result::Result<xcm_executor::Assets, XcmError> {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"internal_transfer_asset what: {:?}, from: {:?}, to: {:?}",
+			what, from, to
+		);
 		// Check we handle this asset.
 		let (asset_id, amount) = Matcher::matches_fungibles(what)?;
 		let source = AccountIdConverter::convert_ref(from)
@@ -161,6 +166,11 @@ impl<
 	>
 {
 	fn can_check_in(_origin: &MultiLocation, what: &MultiAsset) -> Result {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"can_check_in origin: {:?}, what: {:?}",
+			_origin, what
+		);
 		// Check we handle this asset.
 		let (asset_id, amount) = Matcher::matches_fungibles(what)?;
 		if CheckAsset::contains(&asset_id) {
@@ -174,6 +184,11 @@ impl<
 	}
 
 	fn check_in(_origin: &MultiLocation, what: &MultiAsset) {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"check_in origin: {:?}, what: {:?}",
+			_origin, what
+		);
 		if let Ok((asset_id, amount)) = Matcher::matches_fungibles(what) {
 			if CheckAsset::contains(&asset_id) {
 				let checking_account = CheckingAccount::get();
@@ -187,6 +202,11 @@ impl<
 	}
 
 	fn check_out(_dest: &MultiLocation, what: &MultiAsset) {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"check_out dest: {:?}, what: {:?}",
+			_dest, what
+		);
 		if let Ok((asset_id, amount)) = Matcher::matches_fungibles(what) {
 			if CheckAsset::contains(&asset_id) {
 				let checking_account = CheckingAccount::get();
@@ -197,6 +217,11 @@ impl<
 	}
 
 	fn deposit_asset(what: &MultiAsset, who: &MultiLocation) -> Result {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"deposit_asset what: {:?}, who: {:?}",
+			what, who,
+		);
 		// Check we handle this asset.
 		let (asset_id, amount) = Matcher::matches_fungibles(what)?;
 		let who = AccountIdConverter::convert_ref(who)
@@ -209,6 +234,11 @@ impl<
 		what: &MultiAsset,
 		who: &MultiLocation,
 	) -> result::Result<xcm_executor::Assets, XcmError> {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"withdraw_asset what: {:?}, who: {:?}",
+			what, who,
+		);
 		// Check we handle this asset.
 		let (asset_id, amount) = Matcher::matches_fungibles(what)?;
 		let who = AccountIdConverter::convert_ref(who)
@@ -295,12 +325,12 @@ impl<
 		>::withdraw_asset(what, who)
 	}
 
-	fn transfer_asset(
+	fn internal_transfer_asset(
 		what: &MultiAsset,
 		from: &MultiLocation,
 		to: &MultiLocation,
 	) -> result::Result<xcm_executor::Assets, XcmError> {
-		FungiblesTransferAdapter::<Assets, Matcher, AccountIdConverter, AccountId>::transfer_asset(
+		FungiblesTransferAdapter::<Assets, Matcher, AccountIdConverter, AccountId>::internal_transfer_asset(
 			what, from, to,
 		)
 	}

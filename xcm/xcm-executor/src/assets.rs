@@ -94,6 +94,11 @@ impl Assets {
 		self.fungible.len() + self.non_fungible.len()
 	}
 
+	/// Returns `true` if `self` contains no assets.
+	pub fn is_empty(&self) -> bool {
+		self.fungible.is_empty() && self.non_fungible.is_empty()
+	}
+
 	/// A borrowing iterator over the fungible assets.
 	pub fn fungible_assets_iter<'a>(&'a self) -> impl Iterator<Item = MultiAsset> + 'a {
 		self.fungible
@@ -189,7 +194,7 @@ impl Assets {
 		self.fungible = fungible
 			.into_iter()
 			.map(|(mut id, amount)| {
-				let _ = id.reanchor(prepend);
+				let _ = id.prepend_with(prepend);
 				(id, amount)
 			})
 			.collect();
@@ -198,15 +203,51 @@ impl Assets {
 		self.non_fungible = non_fungible
 			.into_iter()
 			.map(|(mut class, inst)| {
-				let _ = class.reanchor(prepend);
+				let _ = class.prepend_with(prepend);
 				(class, inst)
+			})
+			.collect();
+	}
+
+	/// Mutate the assets to be interpreted as the same assets from the perspective of a `target`
+	/// chain. The local chain's `ancestry` is provided.
+	///
+	/// Any assets which were unable to be reanchored are introduced into `failed_bin`.
+	pub fn reanchor(
+		&mut self,
+		target: &MultiLocation,
+		ancestry: &MultiLocation,
+		mut maybe_failed_bin: Option<&mut Self>,
+	) {
+		let mut fungible = Default::default();
+		mem::swap(&mut self.fungible, &mut fungible);
+		self.fungible = fungible
+			.into_iter()
+			.filter_map(|(mut id, amount)| match id.reanchor(target, ancestry) {
+				Ok(()) => Some((id, amount)),
+				Err(()) => {
+					maybe_failed_bin.as_mut().map(|f| f.fungible.insert(id, amount));
+					None
+				},
+			})
+			.collect();
+		let mut non_fungible = Default::default();
+		mem::swap(&mut self.non_fungible, &mut non_fungible);
+		self.non_fungible = non_fungible
+			.into_iter()
+			.filter_map(|(mut class, inst)| match class.reanchor(target, ancestry) {
+				Ok(()) => Some((class, inst)),
+				Err(()) => {
+					maybe_failed_bin.as_mut().map(|f| f.non_fungible.insert((class, inst)));
+					None
+				},
 			})
 			.collect();
 	}
 
 	/// Returns an error unless all `assets` are contained in `self`. In the case of an error, the first asset in
 	/// `assets` which is not wholly in `self` is returned.
-	fn ensure_contains(&self, assets: &MultiAssets) -> Result<(), TakeError> {
+	pub fn ensure_contains(&self, assets: &MultiAssets) -> Result<(), TakeError> {
 		for asset in assets.inner().iter() {
 			match asset {
 				MultiAsset { fun: Fungible(ref amount), ref id } => {

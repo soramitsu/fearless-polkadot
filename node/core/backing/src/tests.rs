@@ -15,22 +15,27 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use super::*;
+use ::test_helpers::{
+	dummy_candidate_receipt_bad_sig, dummy_collator, dummy_collator_signature,
+	dummy_committed_candidate_receipt, dummy_hash, dummy_validation_code,
+};
 use assert_matches::assert_matches;
 use futures::{future, Future};
 use polkadot_node_primitives::{BlockData, InvalidCandidate};
 use polkadot_node_subsystem_test_helpers as test_helpers;
-use polkadot_primitives::v1::{
-	GroupRotationInfo, HeadData, PersistedValidationData, ScheduledCore,
+use polkadot_primitives::v2::{
+	CandidateDescriptor, CollatorId, GroupRotationInfo, HeadData, PersistedValidationData,
+	ScheduledCore,
 };
 use polkadot_subsystem::{
-	messages::{CollatorProtocolMessage, RuntimeApiMessage, RuntimeApiRequest},
+	messages::{CollatorProtocolMessage, RuntimeApiMessage, RuntimeApiRequest, ValidationFailed},
 	ActivatedLeaf, ActiveLeavesUpdate, FromOverseer, LeafStatus, OverseerSignal,
 };
 use sp_application_crypto::AppKey;
 use sp_keyring::Sr25519Keyring;
 use sp_keystore::{CryptoStore, SyncCryptoStore};
 use sp_tracing as _;
-use statement_table::v1::Misbehavior;
+use statement_table::v2::Misbehavior;
 use std::collections::HashMap;
 
 fn validator_pubkeys(val_ids: &[Sr25519Keyring]) -> Vec<ValidatorId> {
@@ -118,9 +123,9 @@ impl Default for TestState {
 
 		let validation_data = PersistedValidationData {
 			parent_head: HeadData(vec![7, 8, 9]),
-			relay_parent_number: Default::default(),
+			relay_parent_number: 0_u32.into(),
 			max_pov_size: 1024,
-			relay_parent_storage_root: Default::default(),
+			relay_parent_storage_root: dummy_hash(),
 		};
 
 		Self {
@@ -148,8 +153,11 @@ fn test_harness<T: Future<Output = VirtualOverseer>>(
 
 	let (context, virtual_overseer) = test_helpers::make_subsystem_context(pool.clone());
 
-	let subsystem =
-		CandidateBackingSubsystem::new(pool.clone(), keystore, Metrics(None)).run(context);
+	let subsystem = async move {
+		if let Err(e) = super::run(context, keystore, Metrics(None)).await {
+			panic!("{:?}", e);
+		}
+	};
 
 	let test_fut = test(virtual_overseer);
 
@@ -189,14 +197,25 @@ impl TestCandidateBuilder {
 				pov_hash: self.pov_hash,
 				relay_parent: self.relay_parent,
 				erasure_root: self.erasure_root,
-				..Default::default()
+				collator: dummy_collator(),
+				signature: dummy_collator_signature(),
+				para_head: dummy_hash(),
+				validation_code_hash: dummy_validation_code().hash(),
+				persisted_validation_data_hash: dummy_hash(),
 			},
-			commitments: CandidateCommitments { head_data: self.head_data, ..Default::default() },
+			commitments: CandidateCommitments {
+				head_data: self.head_data,
+				upward_messages: vec![],
+				horizontal_messages: vec![],
+				new_validation_code: None,
+				processed_downward_messages: 0,
+				hrmp_watermark: 0_u32,
+			},
 		}
 	}
 }
 
-// Tests that the subsystem performs actions that are requied on startup.
+// Tests that the subsystem performs actions that are required on startup.
 async fn test_startup(virtual_overseer: &mut VirtualOverseer, test_state: &TestState) {
 	// Start work on some new parent.
 	virtual_overseer
@@ -266,7 +285,7 @@ async fn test_dispute_coordinator_notifications(
 					candidate_receipt: c_receipt,
 					session: s,
 					statements,
-					pending_confirmation,
+					pending_confirmation: None,
 				}
 			) => {
 				assert_eq!(c_hash, candidate_hash);
@@ -274,7 +293,6 @@ async fn test_dispute_coordinator_notifications(
 				assert_eq!(s, session);
 				assert_eq!(statements.len(), 1);
 				assert_eq!(statements[0].1, validator_index);
-				let _ = pending_confirmation.send(ImportStatementsResult::ValidImport);
 			}
 		)
 	}
@@ -315,11 +333,12 @@ fn backing_second_works() {
 			virtual_overseer.recv().await,
 			AllMessages::CandidateValidation(
 				CandidateValidationMessage::ValidateFromChainState(
-					c,
+					candidate_receipt,
 					pov,
+					timeout,
 					tx,
 				)
-			) if pov == pov && &c == candidate.descriptor() => {
+			) if pov == pov && &candidate_receipt.descriptor == candidate.descriptor() && timeout == BACKING_EXECUTION_TIMEOUT &&  candidate.commitments.hash() == candidate_receipt.commitments_hash => {
 				tx.send(Ok(
 					ValidationResult::Valid(CandidateCommitments {
 						head_data: expected_head_data.clone(),
@@ -336,7 +355,7 @@ fn backing_second_works() {
 		assert_matches!(
 			virtual_overseer.recv().await,
 			AllMessages::AvailabilityStore(
-				AvailabilityStoreMessage::StoreAvailableData(candidate_hash, _, _, _, tx)
+				AvailabilityStoreMessage::StoreAvailableData { candidate_hash, tx, .. }
 			) if candidate_hash == candidate.hash() => {
 				tx.send(Ok(())).unwrap();
 			}
@@ -377,7 +396,7 @@ fn backing_second_works() {
 	});
 }
 
-// Test that the candidate reaches quorum succesfully.
+// Test that the candidate reaches quorum successfully.
 #[test]
 fn backing_works() {
 	let test_state = TestState::default();
@@ -401,6 +420,8 @@ fn backing_works() {
 		.build();
 
 		let candidate_a_hash = candidate_a.hash();
+		let candidate_a_commitments_hash = candidate_a.commitments.hash();
+
 		let public1 = CryptoStore::sr25519_generate_new(
 			&*test_state.keystore,
 			ValidatorId::ID,
@@ -476,9 +497,10 @@ fn backing_works() {
 				CandidateValidationMessage::ValidateFromChainState(
 					c,
 					pov,
+					timeout,
 					tx,
 				)
-			) if pov == pov && &c == candidate_a.descriptor() => {
+			) if pov == pov && c.descriptor() == candidate_a.descriptor() && timeout == BACKING_EXECUTION_TIMEOUT && c.commitments_hash == candidate_a_commitments_hash=> {
 				tx.send(Ok(
 					ValidationResult::Valid(CandidateCommitments {
 						head_data: expected_head_data.clone(),
@@ -495,7 +517,7 @@ fn backing_works() {
 		assert_matches!(
 			virtual_overseer.recv().await,
 			AllMessages::AvailabilityStore(
-				AvailabilityStoreMessage::StoreAvailableData(candidate_hash, _, _, _, tx)
+				AvailabilityStoreMessage::StoreAvailableData { candidate_hash, tx, .. }
 			) if candidate_hash == candidate_a.hash() => {
 				tx.send(Ok(())).unwrap();
 			}
@@ -508,6 +530,18 @@ fn backing_works() {
 			vec![ValidatorIndex(0)],
 		)
 		.await;
+
+		assert_matches!(
+			virtual_overseer.recv().await,
+			AllMessages::Provisioner(
+				ProvisionerMessage::ProvisionableData(
+					_,
+					ProvisionableData::BackedCandidate(candidate_receipt)
+				)
+			) => {
+				assert_eq!(candidate_receipt, candidate_a.to_plain());
+			}
+		);
 
 		assert_matches!(
 			virtual_overseer.recv().await,
@@ -530,18 +564,6 @@ fn backing_works() {
 			vec![ValidatorIndex(5)],
 		)
 		.await;
-
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::Provisioner(
-				ProvisionerMessage::ProvisionableData(
-					_,
-					ProvisionableData::BackedCandidate(candidate_receipt)
-				)
-			) => {
-				assert_eq!(candidate_receipt, candidate_a.to_plain());
-			}
-		);
 
 		virtual_overseer
 			.send(FromOverseer::Signal(OverseerSignal::ActiveLeaves(
@@ -575,6 +597,8 @@ fn backing_works_while_validation_ongoing() {
 		.build();
 
 		let candidate_a_hash = candidate_a.hash();
+		let candidate_a_commitments_hash = candidate_a.commitments.hash();
+
 		let public1 = CryptoStore::sr25519_generate_new(
 			&*test_state.keystore,
 			ValidatorId::ID,
@@ -669,9 +693,10 @@ fn backing_works_while_validation_ongoing() {
 				CandidateValidationMessage::ValidateFromChainState(
 					c,
 					pov,
+					timeout,
 					tx,
 				)
-			) if pov == pov && &c == candidate_a.descriptor() => {
+			) if pov == pov && c.descriptor() == candidate_a.descriptor() && timeout == BACKING_EXECUTION_TIMEOUT && candidate_a_commitments_hash == c.commitments_hash => {
 				// we never validate the candidate. our local node
 				// shouldn't issue any statements.
 				std::mem::forget(tx);
@@ -683,16 +708,11 @@ fn backing_works_while_validation_ongoing() {
 
 		virtual_overseer.send(FromOverseer::Communication { msg: statement }).await;
 
-		let statement =
-			CandidateBackingMessage::Statement(test_state.relay_parent, signed_c.clone());
-
-		virtual_overseer.send(FromOverseer::Communication { msg: statement }).await;
-
 		test_dispute_coordinator_notifications(
 			&mut virtual_overseer,
 			candidate_a.hash(),
 			test_state.session(),
-			vec![ValidatorIndex(5), ValidatorIndex(3)],
+			vec![ValidatorIndex(5)],
 		)
 		.await;
 
@@ -709,6 +729,19 @@ fn backing_works_while_validation_ongoing() {
 				)
 			) if descriptor == candidate_a.descriptor
 		);
+
+		let statement =
+			CandidateBackingMessage::Statement(test_state.relay_parent, signed_c.clone());
+
+		virtual_overseer.send(FromOverseer::Communication { msg: statement }).await;
+
+		test_dispute_coordinator_notifications(
+			&mut virtual_overseer,
+			candidate_a.hash(),
+			test_state.session(),
+			vec![ValidatorIndex(3)],
+		)
+		.await;
 
 		let (tx, rx) = oneshot::channel();
 		let msg = CandidateBackingMessage::GetBackedCandidates(
@@ -734,7 +767,7 @@ fn backing_works_while_validation_ongoing() {
 			.contains(&ValidityAttestation::Explicit(signed_c.signature().clone())));
 		assert_eq!(
 			candidates[0].validator_indices,
-			bitvec::bitvec![bitvec::order::Lsb0, u8; 1, 0, 1, 1],
+			bitvec::bitvec![u8, bitvec::order::Lsb0; 1, 0, 1, 1],
 		);
 
 		virtual_overseer
@@ -771,6 +804,8 @@ fn backing_misbehavior_works() {
 		.build();
 
 		let candidate_a_hash = candidate_a.hash();
+		let candidate_a_commitments_hash = candidate_a.commitments.hash();
+
 		let public2 = CryptoStore::sr25519_generate_new(
 			&*test_state.keystore,
 			ValidatorId::ID,
@@ -834,9 +869,10 @@ fn backing_misbehavior_works() {
 				CandidateValidationMessage::ValidateFromChainState(
 					c,
 					pov,
+					timeout,
 					tx,
 				)
-			) if pov == pov && &c == candidate_a.descriptor() => {
+			) if pov == pov && c.descriptor() == candidate_a.descriptor() && timeout == BACKING_EXECUTION_TIMEOUT && candidate_a_commitments_hash == c.commitments_hash => {
 				tx.send(Ok(
 					ValidationResult::Valid(CandidateCommitments {
 						head_data: expected_head_data.clone(),
@@ -853,7 +889,7 @@ fn backing_misbehavior_works() {
 		assert_matches!(
 			virtual_overseer.recv().await,
 			AllMessages::AvailabilityStore(
-				AvailabilityStoreMessage::StoreAvailableData(candidate_hash, _, _, _, tx)
+				AvailabilityStoreMessage::StoreAvailableData { candidate_hash, tx, .. }
 			) if candidate_hash == candidate_a.hash() => {
 					tx.send(Ok(())).unwrap();
 				}
@@ -866,6 +902,19 @@ fn backing_misbehavior_works() {
 			vec![ValidatorIndex(0)],
 		)
 		.await;
+
+		assert_matches!(
+			virtual_overseer.recv().await,
+			AllMessages::Provisioner(
+				ProvisionerMessage::ProvisionableData(
+					_,
+					ProvisionableData::BackedCandidate(CandidateReceipt {
+						descriptor,
+						..
+					})
+				)
+			) if descriptor == candidate_a.descriptor
+		);
 
 		assert_matches!(
 			virtual_overseer.recv().await,
@@ -980,9 +1029,10 @@ fn backing_dont_second_invalid() {
 				CandidateValidationMessage::ValidateFromChainState(
 					c,
 					pov,
+					timeout,
 					tx,
 				)
-			) if pov == pov && &c == candidate_a.descriptor() => {
+			) if pov == pov && c.descriptor() == candidate_a.descriptor() && timeout == BACKING_EXECUTION_TIMEOUT => {
 				tx.send(Ok(ValidationResult::Invalid(InvalidCandidate::BadReturn))).unwrap();
 			}
 		);
@@ -1008,9 +1058,10 @@ fn backing_dont_second_invalid() {
 				CandidateValidationMessage::ValidateFromChainState(
 					c,
 					pov,
+					timeout,
 					tx,
 				)
-			) if pov == pov && &c == candidate_b.descriptor() => {
+			) if pov == pov && c.descriptor() == candidate_b.descriptor() && timeout == BACKING_EXECUTION_TIMEOUT => {
 				tx.send(Ok(
 					ValidationResult::Valid(CandidateCommitments {
 						head_data: expected_head_data.clone(),
@@ -1027,7 +1078,7 @@ fn backing_dont_second_invalid() {
 		assert_matches!(
 			virtual_overseer.recv().await,
 			AllMessages::AvailabilityStore(
-				AvailabilityStoreMessage::StoreAvailableData(candidate_hash, _, _, _, tx)
+				AvailabilityStoreMessage::StoreAvailableData { candidate_hash, tx, .. }
 			) if candidate_hash == candidate_b.hash() => {
 				tx.send(Ok(())).unwrap();
 			}
@@ -1138,9 +1189,10 @@ fn backing_second_after_first_fails_works() {
 				CandidateValidationMessage::ValidateFromChainState(
 					c,
 					pov,
+					timeout,
 					tx,
 				)
-			) if pov == pov && &c == candidate.descriptor() => {
+			) if pov == pov && c.descriptor() == candidate.descriptor() && timeout == BACKING_EXECUTION_TIMEOUT && c.commitments_hash == candidate.commitments.hash() => {
 				tx.send(Ok(ValidationResult::Invalid(InvalidCandidate::BadReturn))).unwrap();
 			}
 		);
@@ -1185,6 +1237,7 @@ fn backing_second_after_first_fails_works() {
 				CandidateValidationMessage::ValidateFromChainState(
 					_,
 					pov,
+					_,
 					_,
 				)
 			) => {
@@ -1270,9 +1323,10 @@ fn backing_works_after_failed_validation() {
 				CandidateValidationMessage::ValidateFromChainState(
 					c,
 					pov,
+					timeout,
 					tx,
 				)
-			) if pov == pov && &c == candidate.descriptor() => {
+			) if pov == pov && c.descriptor() == candidate.descriptor() && timeout == BACKING_EXECUTION_TIMEOUT && c.commitments_hash == candidate.commitments.hash() => {
 				tx.send(Err(ValidationFailed("Internal test error".into()))).unwrap();
 			}
 		);
@@ -1409,7 +1463,6 @@ fn validation_work_ignores_wrong_collator() {
 #[test]
 fn candidate_backing_reorders_votes() {
 	use sp_core::Encode;
-	use std::convert::TryFrom;
 
 	let para_id = ParaId::from(10);
 	let validators = vec![
@@ -1436,7 +1489,8 @@ fn candidate_backing_reorders_votes() {
 	};
 
 	let fake_attestation = |idx: u32| {
-		let candidate: CommittedCandidateReceipt = Default::default();
+		let candidate =
+			dummy_candidate_receipt_bad_sig(Default::default(), Some(Default::default()));
 		let hash = candidate.hash();
 		let mut data = vec![0; 64];
 		data[0..32].copy_from_slice(hash.0.as_bytes());
@@ -1447,7 +1501,7 @@ fn candidate_backing_reorders_votes() {
 	};
 
 	let attested = TableAttestedCandidate {
-		candidate: Default::default(),
+		candidate: dummy_committed_candidate_receipt(dummy_hash()),
 		validity_votes: vec![
 			(ValidatorIndex(5), fake_attestation(5)),
 			(ValidatorIndex(3), fake_attestation(3)),
@@ -1459,7 +1513,7 @@ fn candidate_backing_reorders_votes() {
 	let backed = table_attested_to_backed(attested, &table_context).unwrap();
 
 	let expected_bitvec = {
-		let mut validator_indices = BitVec::<bitvec::order::Lsb0, u8>::with_capacity(6);
+		let mut validator_indices = BitVec::<u8, bitvec::order::Lsb0>::with_capacity(6);
 		validator_indices.resize(6, false);
 
 		validator_indices.set(1, true);
@@ -1593,18 +1647,25 @@ fn retry_works() {
 		)
 		.await;
 
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::AvailabilityDistribution(
-				AvailabilityDistributionMessage::FetchPoV {
-					relay_parent,
-					tx,
-					..
-				}
+		// Not deterministic which message comes first:
+		for _ in 0u32..2 {
+			match virtual_overseer.recv().await {
+				AllMessages::Provisioner(ProvisionerMessage::ProvisionableData(
+					_,
+					ProvisionableData::BackedCandidate(CandidateReceipt { descriptor, .. }),
+				)) => {
+					assert_eq!(descriptor, candidate.descriptor);
+				},
+				AllMessages::AvailabilityDistribution(
+					AvailabilityDistributionMessage::FetchPoV { relay_parent, tx, .. },
 				) if relay_parent == test_state.relay_parent => {
-				std::mem::drop(tx);
+					std::mem::drop(tx);
+				},
+				msg => {
+					assert!(false, "Unexpected message: {:?}", msg);
+				},
 			}
-		);
+		}
 
 		let statement =
 			CandidateBackingMessage::Statement(test_state.relay_parent, signed_c.clone());
@@ -1618,27 +1679,20 @@ fn retry_works() {
 		)
 		.await;
 
-		// Not deterministic which message comes first:
-		for _ in 0u32..2 {
-			match virtual_overseer.recv().await {
-				AllMessages::Provisioner(ProvisionerMessage::ProvisionableData(
-					_,
-					ProvisionableData::BackedCandidate(CandidateReceipt { descriptor, .. }),
-				)) => {
-					assert_eq!(descriptor, candidate.descriptor);
-				},
+		assert_matches!(
+			virtual_overseer.recv().await,
+			AllMessages::AvailabilityDistribution(
+				AvailabilityDistributionMessage::FetchPoV {
+					relay_parent,
+					tx,
+					..
+				}
 				// Subsystem requests PoV and requests validation.
 				// Now we pass.
-				AllMessages::AvailabilityDistribution(
-					AvailabilityDistributionMessage::FetchPoV { relay_parent, tx, .. },
 				) if relay_parent == test_state.relay_parent => {
 					tx.send(pov.clone()).unwrap();
-				},
-				msg => {
-					assert!(false, "Unexpected message: {:?}", msg);
-				},
-			}
-		}
+				}
+		);
 
 		assert_matches!(
 			virtual_overseer.recv().await,
@@ -1646,9 +1700,10 @@ fn retry_works() {
 				CandidateValidationMessage::ValidateFromChainState(
 					c,
 					pov,
+					timeout,
 					_tx,
 				)
-			) if pov == pov && &c == candidate.descriptor()
+			) if pov == pov && c.descriptor() == candidate.descriptor() && timeout == BACKING_EXECUTION_TIMEOUT && c.commitments_hash == candidate.commitments.hash()
 		);
 		virtual_overseer
 	});
@@ -1748,16 +1803,11 @@ fn observes_backing_even_if_not_validator() {
 
 		virtual_overseer.send(FromOverseer::Communication { msg: statement }).await;
 
-		let statement =
-			CandidateBackingMessage::Statement(test_state.relay_parent, signed_c.clone());
-
-		virtual_overseer.send(FromOverseer::Communication { msg: statement }).await;
-
 		test_dispute_coordinator_notifications(
 			&mut virtual_overseer,
 			candidate_a_hash,
 			test_state.session(),
-			vec![ValidatorIndex(0), ValidatorIndex(5), ValidatorIndex(2)],
+			vec![ValidatorIndex(0), ValidatorIndex(5)],
 		)
 		.await;
 
@@ -1772,6 +1822,19 @@ fn observes_backing_even_if_not_validator() {
 				assert_eq!(candidate_receipt, candidate_a.to_plain());
 			}
 		);
+
+		let statement =
+			CandidateBackingMessage::Statement(test_state.relay_parent, signed_c.clone());
+
+		virtual_overseer.send(FromOverseer::Communication { msg: statement }).await;
+
+		test_dispute_coordinator_notifications(
+			&mut virtual_overseer,
+			candidate_a_hash,
+			test_state.session(),
+			vec![ValidatorIndex(2)],
+		)
+		.await;
 
 		virtual_overseer
 			.send(FromOverseer::Signal(OverseerSignal::ActiveLeaves(

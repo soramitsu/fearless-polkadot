@@ -15,7 +15,7 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::{
-	artifacts::{Artifact, ArtifactPathId},
+	artifacts::{ArtifactPathId, CompiledArtifact},
 	executor_intf::TaskExecutor,
 	worker_common::{
 		bytes_to_path, framed_recv, framed_send, path_to_bytes, spawn_with_program_path,
@@ -34,8 +34,6 @@ use parity_scale_codec::{Decode, Encode};
 use polkadot_parachain::primitives::ValidationResult;
 use std::time::{Duration, Instant};
 
-const EXECUTION_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// Spawns a new worker with the given program path that acts as the worker and the spawn timeout.
 ///
 /// The program should be able to handle `<program-path> execute-worker <socket-path>` invocation.
@@ -51,8 +49,8 @@ pub enum Outcome {
 	/// PVF execution completed successfully and the result is returned. The worker is ready for
 	/// another job.
 	Ok { result_descriptor: ValidationResult, duration_ms: u64, idle_worker: IdleWorker },
-	/// The candidate validation failed. It may be for example because the preparation process
-	/// produced an error or the wasm execution triggered a trap.
+	/// The candidate validation failed. It may be for example because the wasm execution triggered a trap.
+	/// Errors related to the preparation process are not expected to be encountered by the execution workers.
 	InvalidCandidate { err: String, idle_worker: IdleWorker },
 	/// An internal error happened during the validation. Such an error is most likely related to
 	/// some transient glitch.
@@ -69,11 +67,12 @@ pub enum Outcome {
 pub async fn start_work(
 	worker: IdleWorker,
 	artifact: ArtifactPathId,
+	execution_timeout: Duration,
 	validation_params: Vec<u8>,
 ) -> Outcome {
 	let IdleWorker { mut stream, pid } = worker;
 
-	tracing::debug!(
+	gum::debug!(
 		target: LOG_TARGET,
 		worker_pid = %pid,
 		validation_code_hash = ?artifact.id.code_hash,
@@ -82,7 +81,7 @@ pub async fn start_work(
 	);
 
 	if let Err(error) = send_request(&mut stream, &artifact.path, &validation_params).await {
-		tracing::warn!(
+		gum::warn!(
 			target: LOG_TARGET,
 			worker_pid = %pid,
 			validation_code_hash = ?artifact.id.code_hash,
@@ -96,7 +95,7 @@ pub async fn start_work(
 		response = recv_response(&mut stream).fuse() => {
 			match response {
 				Err(error) => {
-					tracing::warn!(
+					gum::warn!(
 						target: LOG_TARGET,
 						worker_pid = %pid,
 						validation_code_hash = ?artifact.id.code_hash,
@@ -108,8 +107,8 @@ pub async fn start_work(
 				Ok(response) => response,
 			}
 		},
-		_ = Delay::new(EXECUTION_TIMEOUT).fuse() => {
-			tracing::warn!(
+		_ = Delay::new(execution_timeout).fuse() => {
+			gum::warn!(
 				target: LOG_TARGET,
 				worker_pid = %pid,
 				validation_code_hash = ?artifact.id.code_hash,
@@ -190,7 +189,7 @@ pub fn worker_entrypoint(socket_path: &str) {
 		})?;
 		loop {
 			let (artifact_path, params) = recv_request(&mut stream).await?;
-			tracing::debug!(
+			gum::debug!(
 				target: LOG_TARGET,
 				worker_pid = %std::process::id(),
 				"worker: validating artifact {}",
@@ -217,18 +216,12 @@ async fn validate_using_artifact(
 		Ok(b) => b,
 	};
 
-	let artifact = match Artifact::deserialize(&artifact_bytes) {
+	let artifact = match CompiledArtifact::decode(&mut artifact_bytes.as_slice()) {
 		Err(e) => return Response::InternalError(format!("artifact deserialization: {:?}", e)),
 		Ok(a) => a,
 	};
 
-	let compiled_artifact = match &artifact {
-		Artifact::PrevalidationErr(msg) => return Response::format_invalid("prevalidation", msg),
-		Artifact::PreparationErr(msg) => return Response::format_invalid("preparation", msg),
-		Artifact::DidntMakeIt => return Response::format_invalid("preparation timeout", ""),
-
-		Artifact::Compiled { compiled_artifact } => compiled_artifact,
-	};
+	let compiled_artifact = artifact.as_ref();
 
 	let validation_started_at = Instant::now();
 	let descriptor_bytes = match unsafe {

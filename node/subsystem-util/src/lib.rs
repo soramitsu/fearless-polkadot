@@ -29,8 +29,8 @@ use polkadot_node_subsystem::{
 	messages::{
 		AllMessages, BoundToRelayParent, RuntimeApiMessage, RuntimeApiRequest, RuntimeApiSender,
 	},
-	overseer, ActiveLeavesUpdate, FromOverseer, OverseerSignal, SpawnedSubsystem, SubsystemContext,
-	SubsystemSender,
+	overseer, ActivatedLeaf, ActiveLeavesUpdate, FromOverseer, OverseerSignal, SpawnedSubsystem,
+	SubsystemContext, SubsystemSender,
 };
 
 pub use overseer::{
@@ -48,23 +48,23 @@ use futures::{
 };
 use parity_scale_codec::Encode;
 use pin_project::pin_project;
-use polkadot_node_jaeger as jaeger;
-use polkadot_primitives::v1::{
+
+use polkadot_primitives::v2::{
 	AuthorityDiscoveryId, CandidateEvent, CommittedCandidateReceipt, CoreState, EncodeAs,
 	GroupIndex, GroupRotationInfo, Hash, Id as ParaId, OccupiedCoreAssumption,
-	PersistedValidationData, SessionIndex, SessionInfo, Signed, SigningContext, ValidationCode,
-	ValidatorId, ValidatorIndex,
+	PersistedValidationData, ScrapedOnChainVotes, SessionIndex, SessionInfo, Signed,
+	SigningContext, ValidationCode, ValidationCodeHash, ValidatorId, ValidatorIndex,
+	ValidatorSignature,
 };
+pub use rand;
 use sp_application_crypto::AppKey;
-use sp_core::{traits::SpawnNamed, Public};
+use sp_core::{traits::SpawnNamed, ByteArray};
 use sp_keystore::{CryptoStore, Error as KeystoreError, SyncCryptoStorePtr};
 use std::{
 	collections::{hash_map::Entry, HashMap},
-	convert::TryFrom,
 	fmt,
 	marker::Unpin,
 	pin::Pin,
-	sync::Arc,
 	task::{Context, Poll},
 	time::Duration,
 };
@@ -74,8 +74,6 @@ pub use metered_channel as metered;
 pub use polkadot_node_network_protocol::MIN_GOSSIP_PEERS;
 
 pub use determine_new_blocks::determine_new_blocks;
-/// Error classification.
-pub use error_handling::{unwrap_non_fatal, Fault};
 
 /// These reexports are required so that external crates can use the `delegated_subsystem` macro properly.
 pub mod reexports {
@@ -87,8 +85,10 @@ pub mod rolling_session_window;
 /// Convenient and efficient runtime info access.
 pub mod runtime;
 
+/// Database trait for subsystem.
+pub mod database;
+
 mod determine_new_blocks;
-mod error_handling;
 
 #[cfg(test)]
 mod tests;
@@ -209,11 +209,16 @@ specialize_requests! {
 	fn request_validator_groups() -> (Vec<Vec<ValidatorIndex>>, GroupRotationInfo); ValidatorGroups;
 	fn request_availability_cores() -> Vec<CoreState>; AvailabilityCores;
 	fn request_persisted_validation_data(para_id: ParaId, assumption: OccupiedCoreAssumption) -> Option<PersistedValidationData>; PersistedValidationData;
+	fn request_assumed_validation_data(para_id: ParaId, expected_persisted_validation_data_hash: Hash) -> Option<(PersistedValidationData, ValidationCodeHash)>; AssumedValidationData;
 	fn request_session_index_for_child() -> SessionIndex; SessionIndexForChild;
 	fn request_validation_code(para_id: ParaId, assumption: OccupiedCoreAssumption) -> Option<ValidationCode>; ValidationCode;
+	fn request_validation_code_by_hash(validation_code_hash: ValidationCodeHash) -> Option<ValidationCode>; ValidationCodeByHash;
 	fn request_candidate_pending_availability(para_id: ParaId) -> Option<CommittedCandidateReceipt>; CandidatePendingAvailability;
 	fn request_candidate_events() -> Vec<CandidateEvent>; CandidateEvents;
 	fn request_session_info(index: SessionIndex) -> Option<SessionInfo>; SessionInfo;
+	fn request_validation_code_hash(para_id: ParaId, assumption: OccupiedCoreAssumption)
+		-> Option<ValidationCodeHash>; ValidationCodeHash;
+	fn request_on_chain_votes() -> Option<ScrapedOnChainVotes>; FetchOnChainVotes;
 }
 
 /// From the given set of validators, find the first key we can sign with, if any.
@@ -238,6 +243,25 @@ pub async fn signing_key_and_index(
 	None
 }
 
+/// Sign the given data with the given validator ID.
+///
+/// Returns `Ok(None)` if the private key that correponds to that validator ID is not found in the
+/// given keystore. Returns an error if the key could not be used for signing.
+pub async fn sign(
+	keystore: &SyncCryptoStorePtr,
+	key: &ValidatorId,
+	data: &[u8],
+) -> Result<Option<ValidatorSignature>, KeystoreError> {
+	let signature =
+		CryptoStore::sign_with(&**keystore, ValidatorId::ID, &key.into(), &data).await?;
+
+	match signature {
+		Some(sig) =>
+			Ok(Some(sig.try_into().map_err(|_| KeystoreError::KeyNotSupported(ValidatorId::ID))?)),
+		None => Ok(None),
+	}
+}
+
 /// Find the validator group the given validator index belongs to.
 pub fn find_validator_group(
 	groups: &[Vec<ValidatorIndex>],
@@ -254,33 +278,41 @@ pub fn find_validator_group(
 
 /// Choose a random subset of `min` elements.
 /// But always include `is_priority` elements.
-pub fn choose_random_subset<T, F: FnMut(&T) -> bool>(
+pub fn choose_random_subset<T, F: FnMut(&T) -> bool>(is_priority: F, v: &mut Vec<T>, min: usize) {
+	choose_random_subset_with_rng(is_priority, v, &mut rand::thread_rng(), min)
+}
+
+/// Choose a random subset of `min` elements using a specific Random Generator `Rng`
+/// But always include `is_priority` elements.
+pub fn choose_random_subset_with_rng<T, F: FnMut(&T) -> bool, R: rand::Rng>(
 	is_priority: F,
-	mut v: Vec<T>,
+	v: &mut Vec<T>,
+	rng: &mut R,
 	min: usize,
-) -> Vec<T> {
+) {
 	use rand::seq::SliceRandom as _;
 
 	// partition the elements into priority first
 	// the returned index is when non_priority elements start
-	let i = itertools::partition(&mut v, is_priority);
+	let i = itertools::partition(v.iter_mut(), is_priority);
 
 	if i >= min || v.len() <= i {
 		v.truncate(i);
-		return v
+		return
 	}
 
-	let mut rng = rand::thread_rng();
-	v[i..].shuffle(&mut rng);
+	v[i..].shuffle(rng);
 
 	v.truncate(min);
-	v
 }
 
 /// Returns a `bool` with a probability of `a / b` of being true.
 pub fn gen_ratio(a: usize, b: usize) -> bool {
-	use rand::Rng as _;
-	let mut rng = rand::thread_rng();
+	gen_ratio_rng(a, b, &mut rand::thread_rng())
+}
+
+/// Returns a `bool` with a probability of `a / b` of being true.
+pub fn gen_ratio_rng<R: rand::Rng>(a: usize, b: usize, rng: &mut R) -> bool {
 	rng.gen_ratio(a as u32, b as u32)
 }
 
@@ -487,15 +519,14 @@ pub trait JobTrait: Unpin + Sized {
 	/// The `delegate_subsystem!` macro should take care of this.
 	type Metrics: 'static + metrics::Metrics + Send;
 
-	/// Name of the job, i.e. `CandidateBackingJob`
+	/// Name of the job, i.e. `candidate-backing-job`
 	const NAME: &'static str;
 
 	/// Run a job for the given relay `parent`.
 	///
 	/// The job should be ended when `receiver` returns `None`.
 	fn run<S: SubsystemSender>(
-		parent: Hash,
-		span: Arc<jaeger::Span>,
+		leaf: ActivatedLeaf,
 		run_args: Self::RunArgs,
 		metrics: Self::Metrics,
 		receiver: mpsc::Receiver<Self::ToJob>,
@@ -543,8 +574,7 @@ where
 	/// Spawn a new job for this `parent_hash`, with whatever args are appropriate.
 	fn spawn_job<Job, Sender>(
 		&mut self,
-		parent_hash: Hash,
-		span: Arc<jaeger::Span>,
+		leaf: ActivatedLeaf,
 		run_args: Job::RunArgs,
 		metrics: Job::Metrics,
 		sender: Sender,
@@ -552,13 +582,13 @@ where
 		Job: JobTrait<ToJob = ToJob>,
 		Sender: SubsystemSender,
 	{
+		let hash = leaf.hash;
 		let (to_job_tx, to_job_rx) = mpsc::channel(JOB_CHANNEL_CAPACITY);
 		let (from_job_tx, from_job_rx) = mpsc::channel(JOB_CHANNEL_CAPACITY);
 
 		let (future, abort_handle) = future::abortable(async move {
 			if let Err(e) = Job::run(
-				parent_hash,
-				span,
+				leaf,
 				run_args,
 				metrics,
 				to_job_rx,
@@ -566,9 +596,9 @@ where
 			)
 			.await
 			{
-				tracing::error!(
+				gum::error!(
 					job = Job::NAME,
-					parent_hash = %parent_hash,
+					parent_hash = %hash,
 					err = ?e,
 					"job finished with an error",
 				);
@@ -579,12 +609,16 @@ where
 			Ok(())
 		});
 
-		self.spawner.spawn(Job::NAME, future.map(drop).boxed());
+		self.spawner.spawn(
+			Job::NAME,
+			Some(Job::NAME.strip_suffix("-job").unwrap_or(Job::NAME)),
+			future.map(drop).boxed(),
+		);
 		self.outgoing_msgs.push(from_job_rx);
 
 		let handle = JobHandle { _abort_handle: AbortOnDrop(abort_handle), to_job: to_job_tx };
 
-		self.running.insert(parent_hash, handle);
+		self.running.insert(hash, handle);
 	}
 
 	/// Stop the job associated with this `parent_hash`.
@@ -627,13 +661,13 @@ where
 }
 
 /// Parameters to a job subsystem.
-struct JobSubsystemParams<Spawner, RunArgs, Metrics> {
+pub struct JobSubsystemParams<Spawner, RunArgs, Metrics> {
 	/// A spawner for sub-tasks.
 	spawner: Spawner,
 	/// Arguments to each job.
 	run_args: RunArgs,
 	/// Metrics for the subsystem.
-	metrics: Metrics,
+	pub metrics: Metrics,
 }
 
 /// A subsystem which wraps jobs.
@@ -641,11 +675,12 @@ struct JobSubsystemParams<Spawner, RunArgs, Metrics> {
 /// Conceptually, this is very simple: it just loops forever.
 ///
 /// - On incoming overseer messages, it starts or stops jobs as appropriate.
-/// - On other incoming messages, if they can be converted into Job::ToJob and
+/// - On other incoming messages, if they can be converted into `Job::ToJob` and
 ///   include a hash, then they're forwarded to the appropriate individual job.
 /// - On outgoing messages from the jobs, it forwards them to the overseer.
 pub struct JobSubsystem<Job: JobTrait, Spawner> {
-	params: JobSubsystemParams<Spawner, Job::RunArgs, Job::Metrics>,
+	#[allow(missing_docs)]
+	pub params: JobSubsystemParams<Spawner, Job::RunArgs, Job::Metrics>,
 	_marker: std::marker::PhantomData<Job>,
 }
 
@@ -685,8 +720,7 @@ impl<Job: JobTrait, Spawner> JobSubsystem<Job, Spawner> {
 							for activated in activated {
 								let sender = ctx.sender().clone();
 								jobs.spawn_job::<Job, _>(
-									activated.hash,
-									activated.span,
+									activated,
 									run_args.clone(),
 									metrics.clone(),
 									sender,
@@ -708,7 +742,7 @@ impl<Job: JobTrait, Spawner> JobSubsystem<Job, Spawner> {
 							}
 						}
 						Err(err) => {
-							tracing::error!(
+							gum::error!(
 								job = Job::NAME,
 								err = ?err,
 								"error receiving message from subsystem context for job",
@@ -727,7 +761,7 @@ impl<Job: JobTrait, Spawner> JobSubsystem<Job, Spawner> {
 					};
 
 					if let Err(e) = res {
-						tracing::warn!(err = ?e, "failed to handle command from job");
+						gum::warn!(err = ?e, "failed to handle command from job");
 					}
 				}
 				complete => break,
@@ -752,6 +786,6 @@ where
 			Ok(())
 		});
 
-		SpawnedSubsystem { name: Job::NAME.strip_suffix("Job").unwrap_or(Job::NAME), future }
+		SpawnedSubsystem { name: Job::NAME.strip_suffix("-job").unwrap_or(Job::NAME), future }
 	}
 }

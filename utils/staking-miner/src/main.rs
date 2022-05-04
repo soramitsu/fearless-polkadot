@@ -32,16 +32,25 @@ mod dry_run;
 mod emergency_solution;
 mod monitor;
 mod prelude;
-mod rpc_helpers;
+mod rpc;
 mod signer;
+
+use std::str::FromStr;
 
 pub(crate) use prelude::*;
 pub(crate) use signer::get_account_info;
 
-use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
+use clap::Parser;
+use frame_election_provider_support::NposSolver;
+use frame_support::traits::Get;
+use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
 use remote_externalities::{Builder, Mode, OnlineConfig};
-use sp_runtime::traits::Block as BlockT;
-use structopt::StructOpt;
+use rpc::{RpcApiClient, SharedRpcClient};
+use sp_npos_elections::ExtendedBalance;
+use sp_runtime::{traits::Block as BlockT, DeserializeOwned, Perbill};
+use tracing_subscriber::{fmt, EnvFilter};
+
+use std::{ops::Deref, sync::Arc};
 
 pub(crate) enum AnyRuntime {
 	Polkadot,
@@ -65,8 +74,7 @@ macro_rules! construct_runtime_prelude {
 			mod private {
 				use super::*;
 				pub(crate) fn [<create_uxt_ $runtime>](
-					raw_solution: EPM::RawSolution<EPM::CompactOf<Runtime>>,
-					witness: u32,
+					raw_solution: EPM::RawSolution<EPM::SolutionOf<Runtime>>,
 					signer: crate::signer::Signer,
 					nonce: crate::prelude::Index,
 					tip: crate::prelude::Balance,
@@ -78,7 +86,7 @@ macro_rules! construct_runtime_prelude {
 
 					let crate::signer::Signer { account, pair, .. } = signer;
 
-					let local_call = EPMCall::<Runtime>::submit(Box::new(raw_solution), witness);
+					let local_call = EPMCall::<Runtime>::submit { raw_solution: Box::new(raw_solution) };
 					let call: Call = <EPMCall<Runtime> as std::convert::TryInto<Call>>::try_into(local_call)
 						.expect("election provider pallet must exist in the runtime, thus \
 							inner call can be converted, qed."
@@ -87,14 +95,15 @@ macro_rules! construct_runtime_prelude {
 					let extra: SignedExtra = crate::[<signed_ext_builder_ $runtime>](nonce, tip, era);
 					let raw_payload = SignedPayload::new(call, extra).expect("creating signed payload infallible; qed.");
 					let signature = raw_payload.using_encoded(|payload| {
-						pair.clone().sign(payload)
+						pair.sign(payload)
 					});
 					let (call, extra, _) = raw_payload.deconstruct();
-					let address = <Runtime as frame_system::Config>::Lookup::unlookup(account.clone());
+					let address = <Runtime as frame_system::Config>::Lookup::unlookup(account);
 					let extrinsic = UncheckedExtrinsic::new_signed(call, address, signature.into(), extra);
 					log::debug!(
-						target: crate::LOG_TARGET, "constructed extrinsic {}",
-						sp_core::hexdisplay::HexDisplay::from(&extrinsic.encode())
+						target: crate::LOG_TARGET, "constructed extrinsic {} with length {}",
+						sp_core::hexdisplay::HexDisplay::from(&extrinsic.encode()),
+						extrinsic.encode().len(),
 					);
 					extrinsic
 				}
@@ -111,6 +120,7 @@ fn signed_ext_builder_polkadot(
 ) -> polkadot_runtime_exports::SignedExtra {
 	use polkadot_runtime_exports::Runtime;
 	(
+		frame_system::CheckNonZeroSender::<Runtime>::new(),
 		frame_system::CheckSpecVersion::<Runtime>::new(),
 		frame_system::CheckTxVersion::<Runtime>::new(),
 		frame_system::CheckGenesis::<Runtime>::new(),
@@ -129,6 +139,7 @@ fn signed_ext_builder_kusama(
 ) -> kusama_runtime_exports::SignedExtra {
 	use kusama_runtime_exports::Runtime;
 	(
+		frame_system::CheckNonZeroSender::<Runtime>::new(),
 		frame_system::CheckSpecVersion::<Runtime>::new(),
 		frame_system::CheckTxVersion::<Runtime>::new(),
 		frame_system::CheckGenesis::<Runtime>::new(),
@@ -146,6 +157,7 @@ fn signed_ext_builder_westend(
 ) -> westend_runtime_exports::SignedExtra {
 	use westend_runtime_exports::Runtime;
 	(
+		frame_system::CheckNonZeroSender::<Runtime>::new(),
 		frame_system::CheckSpecVersion::<Runtime>::new(),
 		frame_system::CheckTxVersion::<Runtime>::new(),
 		frame_system::CheckGenesis::<Runtime>::new(),
@@ -172,14 +184,17 @@ macro_rules! any_runtime {
 		unsafe {
 			match $crate::RUNTIME {
 				$crate::AnyRuntime::Polkadot => {
+					#[allow(unused)]
 					use $crate::polkadot_runtime_exports::*;
 					$($code)*
 				},
 				$crate::AnyRuntime::Kusama => {
+					#[allow(unused)]
 					use $crate::kusama_runtime_exports::*;
 					$($code)*
 				},
 				$crate::AnyRuntime::Westend => {
+					#[allow(unused)]
 					use $crate::westend_runtime_exports::*;
 					$($code)*
 				}
@@ -188,137 +203,252 @@ macro_rules! any_runtime {
 	}
 }
 
-#[derive(Debug, thiserror::Error)]
-enum Error {
+/// Same as [`any_runtime`], but instead of returning a `Result`, this simply returns `()`. Useful
+/// for situations where the result is not useful and un-ergonomic to handle.
+#[macro_export]
+macro_rules! any_runtime_unit {
+	($($code:tt)*) => {
+		unsafe {
+			match $crate::RUNTIME {
+				$crate::AnyRuntime::Polkadot => {
+					#[allow(unused)]
+					use $crate::polkadot_runtime_exports::*;
+					let _ = $($code)*;
+				},
+				$crate::AnyRuntime::Kusama => {
+					#[allow(unused)]
+					use $crate::kusama_runtime_exports::*;
+					let _ = $($code)*;
+				},
+				$crate::AnyRuntime::Westend => {
+					#[allow(unused)]
+					use $crate::westend_runtime_exports::*;
+					let _ = $($code)*;
+				}
+			}
+		}
+	}
+}
+
+#[derive(frame_support::DebugNoBound, thiserror::Error)]
+enum Error<T: EPM::Config> {
 	Io(#[from] std::io::Error),
-	Jsonrpsee(#[from] jsonrpsee_ws_client::types::Error),
+	JsonRpsee(#[from] jsonrpsee::core::Error),
+	RpcHelperError(#[from] rpc::RpcHelperError),
 	Codec(#[from] codec::Error),
 	Crypto(sp_core::crypto::SecretStringError),
 	RemoteExternalities(&'static str),
-	PalletMiner(EPM::unsigned::MinerError),
-	PalletElection(EPM::ElectionError),
+	PalletMiner(EPM::unsigned::MinerError<T>),
+	PalletElection(EPM::ElectionError<T>),
 	PalletFeasibility(EPM::FeasibilityError),
 	AccountDoesNotExists,
 	IncorrectPhase,
 	AlreadySubmitted,
+	VersionMismatch,
+	StrategyNotSatisfied,
 }
 
-impl From<sp_core::crypto::SecretStringError> for Error {
-	fn from(e: sp_core::crypto::SecretStringError) -> Error {
+impl<T: EPM::Config> From<sp_core::crypto::SecretStringError> for Error<T> {
+	fn from(e: sp_core::crypto::SecretStringError) -> Error<T> {
 		Error::Crypto(e)
 	}
 }
 
-impl From<EPM::unsigned::MinerError> for Error {
-	fn from(e: EPM::unsigned::MinerError) -> Error {
+impl<T: EPM::Config> From<EPM::unsigned::MinerError<T>> for Error<T> {
+	fn from(e: EPM::unsigned::MinerError<T>) -> Error<T> {
 		Error::PalletMiner(e)
 	}
 }
 
-impl From<EPM::ElectionError> for Error {
-	fn from(e: EPM::ElectionError) -> Error {
+impl<T: EPM::Config> From<EPM::ElectionError<T>> for Error<T> {
+	fn from(e: EPM::ElectionError<T>) -> Error<T> {
 		Error::PalletElection(e)
 	}
 }
 
-impl From<EPM::FeasibilityError> for Error {
-	fn from(e: EPM::FeasibilityError) -> Error {
+impl<T: EPM::Config> From<EPM::FeasibilityError> for Error<T> {
+	fn from(e: EPM::FeasibilityError) -> Error<T> {
 		Error::PalletFeasibility(e)
 	}
 }
 
-impl std::fmt::Display for Error {
+impl<T: EPM::Config> std::fmt::Display for Error<T> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		<Error as std::fmt::Debug>::fmt(self, f)
+		<Error<T> as std::fmt::Debug>::fmt(self, f)
 	}
 }
 
-#[derive(Debug, Clone, StructOpt)]
+#[derive(Debug, Clone, Parser)]
+#[cfg_attr(test, derive(PartialEq))]
 enum Command {
 	/// Monitor for the phase being signed, then compute.
 	Monitor(MonitorConfig),
 	/// Just compute a solution now, and don't submit it.
 	DryRun(DryRunConfig),
 	/// Provide a solution that can be submitted to the chain as an emergency response.
-	EmergencySolution,
+	EmergencySolution(EmergencySolutionConfig),
 }
 
-#[derive(Debug, Clone, StructOpt)]
+#[derive(Debug, Clone, Parser)]
+#[cfg_attr(test, derive(PartialEq))]
+enum Solver {
+	SeqPhragmen {
+		#[clap(long, default_value = "10")]
+		iterations: usize,
+	},
+	PhragMMS {
+		#[clap(long, default_value = "10")]
+		iterations: usize,
+	},
+}
+
+/// Submission strategy to use.
+#[derive(Debug, Copy, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+enum SubmissionStrategy {
+	// Only submit if at the time, we are the best.
+	IfLeading,
+	// Always submit.
+	Always,
+	// Submit if we are leading, or if the solution that's leading is more that the given `Perbill`
+	// better than us. This helps detect obviously fake solutions and still combat them.
+	ClaimBetterThan(Perbill),
+}
+
+/// Custom `impl` to parse `SubmissionStrategy` from CLI.
+///
+/// Possible options:
+/// * --submission-strategy if-leading: only submit if leading
+/// * --submission-strategy always: always submit
+/// * --submission-strategy "percent-better <percent>": submit if submission is `n` percent better.
+///
+impl FromStr for SubmissionStrategy {
+	type Err = String;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let s = s.trim();
+
+		let res = if s == "if-leading" {
+			Self::IfLeading
+		} else if s == "always" {
+			Self::Always
+		} else if s.starts_with("percent-better ") {
+			let percent: u32 = s[15..].parse().map_err(|e| format!("{:?}", e))?;
+			Self::ClaimBetterThan(Perbill::from_percent(percent))
+		} else {
+			return Err(s.into())
+		};
+		Ok(res)
+	}
+}
+
+frame_support::parameter_types! {
+	/// Number of balancing iterations for a solution algorithm. Set based on the [`Solvers`] CLI
+	/// config.
+	pub static BalanceIterations: usize = 10;
+	pub static Balancing: Option<(usize, ExtendedBalance)> = Some((BalanceIterations::get(), 0));
+}
+
+#[derive(Debug, Clone, Parser)]
+#[cfg_attr(test, derive(PartialEq))]
 struct MonitorConfig {
 	/// They type of event to listen to.
 	///
 	/// Typically, finalized is safer and there is no chance of anything going wrong, but it can be
 	/// slower. It is recommended to use finalized, if the duration of the signed phase is longer
 	/// than the the finality delay.
-	#[structopt(long, default_value = "head", possible_values = &["head", "finalized"])]
+	#[clap(long, default_value = "head", possible_values = &["head", "finalized"])]
 	listen: String,
 
-	#[structopt(long, short, default_value = "10")]
-	iterations: usize,
+	/// The solver algorithm to use.
+	#[clap(subcommand)]
+	solver: Solver,
+
+	/// Submission strategy to use.
+	///
+	/// Possible options:
+	///
+	/// `--submission-strategy if-leading`: only submit if leading.
+	///
+	/// `--submission-strategy always`: always submit.
+	///
+	/// `--submission-strategy "percent-better <percent>"`: submit if the submission is `n` percent better.
+	#[clap(long, parse(try_from_str), default_value = "if-leading")]
+	submission_strategy: SubmissionStrategy,
 }
 
-#[derive(Debug, Clone, StructOpt)]
-struct DryRunConfig {
+#[derive(Debug, Clone, Parser)]
+#[cfg_attr(test, derive(PartialEq))]
+struct EmergencySolutionConfig {
 	/// The block hash at which scraping happens. If none is provided, the latest head is used.
-	#[structopt(long)]
+	#[clap(long)]
 	at: Option<Hash>,
 
-	#[structopt(long, short, default_value = "10")]
-	iterations: usize,
+	/// The solver algorithm to use.
+	#[clap(subcommand)]
+	solver: Solver,
+
+	/// The number of top backed winners to take. All are taken, if not provided.
+	take: Option<usize>,
 }
 
-#[derive(Debug, Clone, StructOpt)]
-struct SharedConfig {
-	/// The `ws` node to connect to.
-	#[structopt(long, default_value = DEFAULT_URI)]
-	uri: String,
+#[derive(Debug, Clone, Parser)]
+#[cfg_attr(test, derive(PartialEq))]
+struct DryRunConfig {
+	/// The block hash at which scraping happens. If none is provided, the latest head is used.
+	#[clap(long)]
+	at: Option<Hash>,
 
-	/// The file from which we read the account seed.
-	///
-	/// WARNING: don't use an account with a large stash for this. Based on how the bot is
-	/// configured, it might re-try lose funds through transaction fees/deposits.
-	#[structopt(long)]
-	account_seed: std::path::PathBuf,
+	/// The solver algorithm to use.
+	#[clap(subcommand)]
+	solver: Solver,
+
+	/// Force create a new snapshot, else expect one to exist onchain.
+	#[clap(long)]
+	force_snapshot: bool,
 }
 
-#[derive(Debug, Clone, StructOpt)]
+#[derive(Debug, Clone, Parser)]
+#[cfg_attr(test, derive(PartialEq))]
+#[clap(author, version, about)]
 struct Opt {
 	/// The `ws` node to connect to.
-	#[structopt(flatten)]
-	shared: SharedConfig,
+	#[clap(long, short, default_value = DEFAULT_URI, env = "URI")]
+	uri: String,
 
-	#[structopt(subcommand)]
+	/// The path to a file containing the seed of the account. If the file is not found, the seed is
+	/// used as-is.
+	///
+	/// Can also be provided via the `SEED` environment variable.
+	///
+	/// WARNING: Don't use an account with a large stash for this. Based on how the bot is
+	/// configured, it might re-try and lose funds through transaction fees/deposits.
+	#[clap(long, short, env = "SEED")]
+	seed_or_path: String,
+
+	#[clap(subcommand)]
 	command: Command,
 }
 
-/// Build the `Ext` at `hash` with all the data of `ElectionProviderMultiPhase` and `Staking`
-/// stored.
-async fn create_election_ext<T: EPM::Config, B: BlockT>(
-	uri: String,
+/// Build the Ext at hash with all the data of `ElectionProviderMultiPhase` and any additional
+/// pallets.
+async fn create_election_ext<T: EPM::Config, B: BlockT + DeserializeOwned>(
+	client: SharedRpcClient,
 	at: Option<B::Hash>,
-	with_staking: bool,
-) -> Result<Ext, Error> {
+	additional: Vec<String>,
+) -> Result<Ext, Error<T>> {
 	use frame_support::{storage::generator::StorageMap, traits::PalletInfo};
 	use sp_core::hashing::twox_128;
 
+	let mut pallets = vec![<T as frame_system::Config>::PalletInfo::name::<EPM::Pallet<T>>()
+		.expect("Pallet always has name; qed.")
+		.to_string()];
+	pallets.extend(additional);
 	Builder::<B>::new()
 		.mode(Mode::Online(OnlineConfig {
-			transport: uri.into(),
+			transport: client.into_inner().into(),
 			at,
-			modules: if with_staking {
-				vec![
-					<T as frame_system::Config>::PalletInfo::name::<EPM::Pallet<T>>()
-						.expect("Pallet always has name; qed.")
-						.to_string(),
-					<T as frame_system::Config>::PalletInfo::name::<pallet_staking::Pallet<T>>()
-						.expect("Pallet always has name; qed.")
-						.to_string(),
-				]
-			} else {
-				vec![<T as frame_system::Config>::PalletInfo::name::<EPM::Pallet<T>>()
-					.expect("Pallet always has name; qed.")
-					.to_string()]
-			},
+			pallets,
 			..Default::default()
 		}))
 		.inject_hashed_prefix(&<frame_system::BlockHash<T>>::prefix_hash())
@@ -328,28 +458,68 @@ async fn create_election_ext<T: EPM::Config, B: BlockT>(
 		.map_err(|why| Error::RemoteExternalities(why))
 }
 
-/// Compute the election at the given block number. It expects to NOT be `Phase::Off`. In other
-/// words, the snapshot must exists on the given externalities.
-fn mine_unchecked<T: EPM::Config>(
+/// Compute the election. It expects to NOT be `Phase::Off`. In other words, the snapshot must
+/// exists on the given externalities.
+fn mine_solution<T, S>(
 	ext: &mut Ext,
-	iterations: usize,
 	do_feasibility: bool,
-) -> Result<(EPM::RawSolution<EPM::CompactOf<T>>, u32), Error> {
+) -> Result<EPM::RawSolution<EPM::SolutionOf<T>>, Error<T>>
+where
+	T: EPM::Config,
+	S: NposSolver<
+		Error = <<T as EPM::Config>::Solver as NposSolver>::Error,
+		AccountId = <<T as EPM::Config>::Solver as NposSolver>::AccountId,
+	>,
+{
 	ext.execute_with(|| {
-		let (solution, _) = <EPM::Pallet<T>>::mine_solution(iterations)?;
+		let (solution, _) =
+			<EPM::Pallet<T>>::mine_solution::<S>().map_err::<Error<T>, _>(Into::into)?;
 		if do_feasibility {
 			let _ = <EPM::Pallet<T>>::feasibility_check(
 				solution.clone(),
 				EPM::ElectionCompute::Signed,
 			)?;
 		}
-		let witness = <EPM::SignedSubmissions<T>>::decode_len().unwrap_or_default();
-		Ok((solution, witness as u32))
+		Ok(solution)
 	})
 }
 
+/// Mine a solution with the given `solver`.
+fn mine_with<T>(
+	solver: &Solver,
+	ext: &mut Ext,
+	do_feasibility: bool,
+) -> Result<EPM::RawSolution<EPM::SolutionOf<T>>, Error<T>>
+where
+	T: EPM::Config,
+	T::Solver: NposSolver<Error = sp_npos_elections::Error>,
+{
+	use frame_election_provider_support::{PhragMMS, SequentialPhragmen};
+
+	match solver {
+		Solver::SeqPhragmen { iterations } => {
+			BalanceIterations::set(*iterations);
+			mine_solution::<
+				T,
+				SequentialPhragmen<
+					<T as frame_system::Config>::AccountId,
+					sp_runtime::Perbill,
+					Balancing,
+				>,
+			>(ext, do_feasibility)
+		},
+		Solver::PhragMMS { iterations } => {
+			BalanceIterations::set(*iterations);
+			mine_solution::<
+				T,
+				PhragMMS<<T as frame_system::Config>::AccountId, sp_runtime::Perbill, Balancing>,
+			>(ext, do_feasibility)
+		},
+	}
+}
+
 #[allow(unused)]
-fn mine_dpos<T: EPM::Config>(ext: &mut Ext) -> Result<(), Error> {
+fn mine_dpos<T: EPM::Config>(ext: &mut Ext) -> Result<(), Error<T>> {
 	ext.execute_with(|| {
 		use std::collections::BTreeMap;
 		use EPM::RoundSnapshot;
@@ -357,7 +527,7 @@ fn mine_dpos<T: EPM::Config>(ext: &mut Ext) -> Result<(), Error> {
 		let desired_targets = EPM::DesiredTargets::<T>::get().unwrap();
 		let mut candidates_and_backing = BTreeMap::<T::AccountId, u128>::new();
 		voters.into_iter().for_each(|(who, stake, targets)| {
-			if targets.len() == 0 {
+			if targets.is_empty() {
 				println!("target = {:?}", (who, stake, targets));
 				return
 			}
@@ -386,22 +556,38 @@ fn mine_dpos<T: EPM::Config>(ext: &mut Ext) -> Result<(), Error> {
 	})
 }
 
+pub(crate) async fn check_versions<T: frame_system::Config + EPM::Config>(
+	rpc: &SharedRpcClient,
+) -> Result<(), Error<T>> {
+	let linked_version = T::Version::get();
+	let on_chain_version = rpc
+		.runtime_version(None)
+		.await
+		.expect("runtime version RPC should always work; qed");
+
+	log::debug!(target: LOG_TARGET, "linked version {:?}", linked_version);
+	log::debug!(target: LOG_TARGET, "on-chain version {:?}", on_chain_version);
+
+	if linked_version != on_chain_version {
+		log::error!(
+			target: LOG_TARGET,
+			"VERSION MISMATCH: any transaction will fail with bad-proof"
+		);
+		Err(Error::VersionMismatch)
+	} else {
+		Ok(())
+	}
+}
+
 #[tokio::main]
 async fn main() {
-	env_logger::Builder::from_default_env()
-		.format_module_path(true)
-		.format_level(true)
-		.init();
-	let Opt { shared, command } = Opt::from_args();
-	log::debug!(target: LOG_TARGET, "attempting to connect to {:?}", shared.uri);
+	fmt().with_env_filter(EnvFilter::from_default_env()).init();
 
-	let client = loop {
-		let maybe_client = WsClientBuilder::default()
-			.connection_timeout(std::time::Duration::new(20, 0))
-			.max_request_body_size(u32::MAX)
-			.build(&shared.uri)
-			.await;
-		match maybe_client {
+	let Opt { uri, seed_or_path, command } = Opt::parse();
+	log::debug!(target: LOG_TARGET, "attempting to connect to {:?}", uri);
+
+	let rpc = loop {
+		match SharedRpcClient::new(&uri).await {
 			Ok(client) => break client,
 			Err(why) => {
 				log::warn!(
@@ -409,19 +595,19 @@ async fn main() {
 					"failed to connect to client due to {:?}, retrying soon..",
 					why
 				);
-				std::thread::sleep(std::time::Duration::from_millis(2500));
+				tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 			},
 		}
 	};
 
-	let chain = rpc_helpers::rpc::<String>(&client, "system_chain", params! {})
-		.await
-		.expect("system_chain infallible; qed.");
+	let chain: String = rpc.system_chain().await.expect("system_chain infallible; qed.");
 	match chain.to_lowercase().as_str() {
 		"polkadot" | "development" => {
 			sp_core::crypto::set_default_ss58_version(
-				sp_core::crypto::Ss58AddressFormat::PolkadotAccount,
+				sp_core::crypto::Ss58AddressFormatRegistry::PolkadotAccount.into(),
 			);
+			sub_tokens::dynamic::set_name("DOT");
+			sub_tokens::dynamic::set_decimal_points(10_000_000_000);
 			// safety: this program will always be single threaded, thus accessing global static is
 			// safe.
 			unsafe {
@@ -430,8 +616,10 @@ async fn main() {
 		},
 		"kusama" | "kusama-dev" => {
 			sp_core::crypto::set_default_ss58_version(
-				sp_core::crypto::Ss58AddressFormat::KusamaAccount,
+				sp_core::crypto::Ss58AddressFormatRegistry::KusamaAccount.into(),
 			);
+			sub_tokens::dynamic::set_name("KSM");
+			sub_tokens::dynamic::set_decimal_points(1_000_000_000_000);
 			// safety: this program will always be single threaded, thus accessing global static is
 			// safe.
 			unsafe {
@@ -440,8 +628,10 @@ async fn main() {
 		},
 		"westend" => {
 			sp_core::crypto::set_default_ss58_version(
-				sp_core::crypto::Ss58AddressFormat::PolkadotAccount,
+				sp_core::crypto::Ss58AddressFormatRegistry::PolkadotAccount.into(),
 			);
+			sub_tokens::dynamic::set_name("WND");
+			sub_tokens::dynamic::set_decimal_points(1_000_000_000_000);
 			// safety: this program will always be single threaded, thus accessing global static is
 			// safe.
 			unsafe {
@@ -455,18 +645,30 @@ async fn main() {
 	}
 	log::info!(target: LOG_TARGET, "connected to chain {:?}", chain);
 
+	any_runtime_unit! {
+		check_versions::<Runtime>(&rpc).await
+	};
+
 	let signer_account = any_runtime! {
-		signer::read_signer_uri::<_, Runtime>(&shared.account_seed, &client)
+		signer::signer_uri_from_string::<Runtime>(&seed_or_path, &rpc)
 			.await
 			.expect("Provided account is invalid, terminating.")
 	};
 
 	let outcome = any_runtime! {
-		match command.clone() {
-			Command::Monitor(c) => monitor_cmd(&client, shared, c, signer_account).await,
-			// --------------------^^ comes from the macro prelude, needs no generic.
-			Command::DryRun(c) => dry_run_cmd(&client, shared, c, signer_account).await,
-			Command::EmergencySolution => emergency_solution_cmd(shared.clone()).await,
+		match command {
+			Command::Monitor(cmd) => monitor_cmd(rpc, cmd, signer_account).await
+				.map_err(|e| {
+					log::error!(target: LOG_TARGET, "Monitor error: {:?}", e);
+				}),
+			Command::DryRun(cmd) => dry_run_cmd(rpc, cmd, signer_account).await
+				.map_err(|e| {
+					log::error!(target: LOG_TARGET, "DryRun error: {:?}", e);
+				}),
+			Command::EmergencySolution(cmd) => emergency_solution_cmd(rpc, cmd).await
+				.map_err(|e| {
+					log::error!(target: LOG_TARGET, "EmergencySolution error: {:?}", e);
+				}),
 		}
 	};
 	log::info!(target: LOG_TARGET, "round of execution finished. outcome = {:?}", outcome);
@@ -477,7 +679,6 @@ mod tests {
 	use super::*;
 
 	fn get_version<T: frame_system::Config>() -> sp_version::RuntimeVersion {
-		use frame_support::traits::Get;
 		T::Version::get()
 	}
 
@@ -495,5 +696,103 @@ mod tests {
 
 		assert_eq!(polkadot_version.spec_name, "polkadot".into());
 		assert_eq!(kusama_version.spec_name, "kusama".into());
+	}
+
+	#[test]
+	fn cli_monitor_works() {
+		let opt = Opt::try_parse_from([
+			env!("CARGO_PKG_NAME"),
+			"--uri",
+			"hi",
+			"--seed-or-path",
+			"//Alice",
+			"monitor",
+			"--listen",
+			"head",
+			"seq-phragmen",
+		])
+		.unwrap();
+
+		assert_eq!(
+			opt,
+			Opt {
+				uri: "hi".to_string(),
+				seed_or_path: "//Alice".to_string(),
+				command: Command::Monitor(MonitorConfig {
+					listen: "head".to_string(),
+					solver: Solver::SeqPhragmen { iterations: 10 },
+					submission_strategy: SubmissionStrategy::IfLeading,
+				}),
+			}
+		);
+	}
+
+	#[test]
+	fn cli_dry_run_works() {
+		let opt = Opt::try_parse_from([
+			env!("CARGO_PKG_NAME"),
+			"--uri",
+			"hi",
+			"--seed-or-path",
+			"//Alice",
+			"dry-run",
+			"phrag-mms",
+		])
+		.unwrap();
+
+		assert_eq!(
+			opt,
+			Opt {
+				uri: "hi".to_string(),
+				seed_or_path: "//Alice".to_string(),
+				command: Command::DryRun(DryRunConfig {
+					at: None,
+					solver: Solver::PhragMMS { iterations: 10 },
+					force_snapshot: false,
+				}),
+			}
+		);
+	}
+
+	#[test]
+	fn cli_emergency_works() {
+		let opt = Opt::try_parse_from([
+			env!("CARGO_PKG_NAME"),
+			"--uri",
+			"hi",
+			"--seed-or-path",
+			"//Alice",
+			"emergency-solution",
+			"99",
+			"phrag-mms",
+			"--iterations",
+			"1337",
+		])
+		.unwrap();
+
+		assert_eq!(
+			opt,
+			Opt {
+				uri: "hi".to_string(),
+				seed_or_path: "//Alice".to_string(),
+				command: Command::EmergencySolution(EmergencySolutionConfig {
+					take: Some(99),
+					at: None,
+					solver: Solver::PhragMMS { iterations: 1337 }
+				}),
+			}
+		);
+	}
+
+	#[test]
+	fn submission_strategy_from_str_works() {
+		use std::str::FromStr;
+
+		assert_eq!(SubmissionStrategy::from_str("if-leading"), Ok(SubmissionStrategy::IfLeading));
+		assert_eq!(SubmissionStrategy::from_str("always"), Ok(SubmissionStrategy::Always));
+		assert_eq!(
+			SubmissionStrategy::from_str("  percent-better 99   "),
+			Ok(SubmissionStrategy::ClaimBetterThan(Perbill::from_percent(99)))
+		);
 	}
 }

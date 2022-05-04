@@ -19,25 +19,28 @@
 #![deny(unused_crate_dependencies)]
 #![warn(missing_docs)]
 
+use always_assert::never;
+use bytes::Bytes;
 use futures::{prelude::*, stream::BoxStream};
-use parity_scale_codec::{Decode, Encode};
+use parity_scale_codec::{Decode, DecodeAll, Encode};
 use parking_lot::Mutex;
-use polkadot_subsystem::messages::DisputeDistributionMessage;
 use sc_network::Event as NetworkEvent;
 use sp_consensus::SyncOracle;
 
 use polkadot_node_network_protocol::{
-	peer_set::PeerSet, v1 as protocol_v1, ObservedRole, OurView, PeerId,
-	UnifiedReputationChange as Rep, View,
+	self as net_protocol,
+	peer_set::{PeerSet, PerPeerSet},
+	v1 as protocol_v1, ObservedRole, OurView, PeerId, ProtocolVersion,
+	UnifiedReputationChange as Rep, Versioned, View,
 };
 use polkadot_node_subsystem_util::metrics::{self, prometheus};
 use polkadot_overseer::gen::{OverseerError, Subsystem};
-use polkadot_primitives::v1::{BlockNumber, Hash};
+use polkadot_primitives::v2::{AuthorityDiscoveryId, BlockNumber, Hash, ValidatorIndex};
 use polkadot_subsystem::{
 	errors::{SubsystemError, SubsystemResult},
 	messages::{
+		network_bridge_event::{NewGossipTopology, TopologyPeerInfo},
 		AllMessages, CollatorProtocolMessage, NetworkBridgeEvent, NetworkBridgeMessage,
-		StatementDistributionMessage,
 	},
 	overseer, ActivatedLeaf, ActiveLeavesUpdate, FromOverseer, OverseerSignal, SpawnedSubsystem,
 	SubsystemContext, SubsystemSender,
@@ -49,7 +52,8 @@ use polkadot_subsystem::{
 pub use polkadot_node_network_protocol::peer_set::{peer_sets_info, IsAuthority};
 
 use std::{
-	collections::{hash_map, HashMap, HashSet},
+	collections::{hash_map, HashMap},
+	iter::ExactSizeIterator,
 	sync::Arc,
 };
 
@@ -60,10 +64,6 @@ mod validator_discovery;
 /// Defines the `Network` trait with an implementation for an `Arc<NetworkService>`.
 mod network;
 use network::{send_message, Network};
-
-/// Request multiplexer for combining the multiple request sources into a single `Stream` of `AllMessages`.
-mod multiplexer;
-pub use multiplexer::RequestMultiplexer;
 
 use crate::network::get_peer_id_by_authority_id;
 
@@ -87,58 +87,69 @@ const LOG_TARGET: &'static str = "parachain::network-bridge";
 #[derive(Clone, Default)]
 pub struct Metrics(Option<MetricsInner>);
 
+fn peer_set_label(peer_set: PeerSet, version: ProtocolVersion) -> &'static str {
+	// Higher level code is meant to protect against this ever happening.
+	peer_set.get_protocol_name_static(version).unwrap_or("<internal error>")
+}
+
 impl Metrics {
-	fn on_peer_connected(&self, peer_set: PeerSet) {
+	fn on_peer_connected(&self, peer_set: PeerSet, version: ProtocolVersion) {
 		self.0.as_ref().map(|metrics| {
 			metrics
 				.connected_events
-				.with_label_values(&[peer_set.get_protocol_name_static()])
+				.with_label_values(&[peer_set_label(peer_set, version)])
 				.inc()
 		});
 	}
 
-	fn on_peer_disconnected(&self, peer_set: PeerSet) {
+	fn on_peer_disconnected(&self, peer_set: PeerSet, version: ProtocolVersion) {
 		self.0.as_ref().map(|metrics| {
 			metrics
 				.disconnected_events
-				.with_label_values(&[peer_set.get_protocol_name_static()])
+				.with_label_values(&[peer_set_label(peer_set, version)])
 				.inc()
 		});
 	}
 
-	fn note_peer_count(&self, peer_set: PeerSet, count: usize) {
+	fn note_peer_count(&self, peer_set: PeerSet, version: ProtocolVersion, count: usize) {
 		self.0.as_ref().map(|metrics| {
 			metrics
 				.peer_count
-				.with_label_values(&[peer_set.get_protocol_name_static()])
+				.with_label_values(&[peer_set_label(peer_set, version)])
 				.set(count as u64)
 		});
 	}
 
-	fn on_notification_received(&self, peer_set: PeerSet, size: usize) {
+	fn on_notification_received(&self, peer_set: PeerSet, version: ProtocolVersion, size: usize) {
 		if let Some(metrics) = self.0.as_ref() {
 			metrics
 				.notifications_received
-				.with_label_values(&[peer_set.get_protocol_name_static()])
+				.with_label_values(&[peer_set_label(peer_set, version)])
 				.inc();
 
 			metrics
 				.bytes_received
-				.with_label_values(&[peer_set.get_protocol_name_static()])
+				.with_label_values(&[peer_set_label(peer_set, version)])
 				.inc_by(size as u64);
 		}
 	}
 
-	fn on_notification_sent(&self, peer_set: PeerSet, size: usize, to_peers: usize) {
+	fn on_notification_sent(
+		&self,
+		peer_set: PeerSet,
+		version: ProtocolVersion,
+		size: usize,
+		to_peers: usize,
+	) {
 		if let Some(metrics) = self.0.as_ref() {
 			metrics
 				.notifications_sent
-				.with_label_values(&[peer_set.get_protocol_name_static()])
+				.with_label_values(&[peer_set_label(peer_set, version)])
 				.inc_by(to_peers as u64);
 
 			metrics
 				.bytes_sent
-				.with_label_values(&[peer_set.get_protocol_name_static()])
+				.with_label_values(&[peer_set_label(peer_set, version)])
 				.inc_by((size * to_peers) as u64);
 		}
 	}
@@ -147,9 +158,15 @@ impl Metrics {
 		self.0.as_ref().map(|metrics| {
 			metrics
 				.desired_peer_count
-				.with_label_values(&[peer_set.get_protocol_name_static()])
+				.with_label_values(&[peer_set.get_default_protocol_name()])
 				.set(size as u64)
 		});
+	}
+
+	fn on_report_event(&self) {
+		if let Some(metrics) = self.0.as_ref() {
+			metrics.report_events.inc()
+		}
 	}
 }
 
@@ -159,6 +176,7 @@ struct MetricsInner {
 	connected_events: prometheus::CounterVec<prometheus::U64>,
 	disconnected_events: prometheus::CounterVec<prometheus::U64>,
 	desired_peer_count: prometheus::GaugeVec<prometheus::U64>,
+	report_events: prometheus::Counter<prometheus::U64>,
 
 	notifications_received: prometheus::CounterVec<prometheus::U64>,
 	notifications_sent: prometheus::CounterVec<prometheus::U64>,
@@ -175,7 +193,7 @@ impl metrics::Metrics for Metrics {
 			peer_count: prometheus::register(
 				prometheus::GaugeVec::new(
 					prometheus::Opts::new(
-						"parachain_peer_count",
+						"polkadot_parachain_peer_count",
 						"The number of peers on a parachain-related peer-set",
 					),
 					&["protocol"]
@@ -185,7 +203,7 @@ impl metrics::Metrics for Metrics {
 			connected_events: prometheus::register(
 				prometheus::CounterVec::new(
 					prometheus::Opts::new(
-						"parachain_peer_connect_events_total",
+						"polkadot_parachain_peer_connect_events_total",
 						"The number of peer connect events on a parachain notifications protocol",
 					),
 					&["protocol"]
@@ -195,7 +213,7 @@ impl metrics::Metrics for Metrics {
 			disconnected_events: prometheus::register(
 				prometheus::CounterVec::new(
 					prometheus::Opts::new(
-						"parachain_peer_disconnect_events_total",
+						"polkadot_parachain_peer_disconnect_events_total",
 						"The number of peer disconnect events on a parachain notifications protocol",
 					),
 					&["protocol"]
@@ -205,17 +223,24 @@ impl metrics::Metrics for Metrics {
 			desired_peer_count: prometheus::register(
 				prometheus::GaugeVec::new(
 					prometheus::Opts::new(
-						"parachain_desired_peer_count",
-						"The number of peers that the local node is expected to connect to on a parachain-related peer-set",
+						"polkadot_parachain_desired_peer_count",
+						"The number of peers that the local node is expected to connect to on a parachain-related peer-set (either including or not including unresolvable authorities, depending on whether `ConnectToValidators` or `ConnectToValidatorsResolved` was used.)",
 					),
 					&["protocol"]
+				)?,
+				registry,
+			)?,
+			report_events: prometheus::register(
+				prometheus::Counter::new(
+					"polkadot_parachain_network_report_events_total",
+					"The amount of reputation changes issued by subsystems",
 				)?,
 				registry,
 			)?,
 			notifications_received: prometheus::register(
 				prometheus::CounterVec::new(
 					prometheus::Opts::new(
-						"parachain_notifications_received_total",
+						"polkadot_parachain_notifications_received_total",
 						"The number of notifications received on a parachain protocol",
 					),
 					&["protocol"]
@@ -225,7 +250,7 @@ impl metrics::Metrics for Metrics {
 			notifications_sent: prometheus::register(
 				prometheus::CounterVec::new(
 					prometheus::Opts::new(
-						"parachain_notifications_sent_total",
+						"polkadot_parachain_notifications_sent_total",
 						"The number of notifications sent on a parachain protocol",
 					),
 					&["protocol"]
@@ -235,7 +260,7 @@ impl metrics::Metrics for Metrics {
 			bytes_received: prometheus::register(
 				prometheus::CounterVec::new(
 					prometheus::Opts::new(
-						"parachain_notification_bytes_received_total",
+						"polkadot_parachain_notification_bytes_received_total",
 						"The number of bytes received on a parachain notification protocol",
 					),
 					&["protocol"]
@@ -245,7 +270,7 @@ impl metrics::Metrics for Metrics {
 			bytes_sent: prometheus::register(
 				prometheus::CounterVec::new(
 					prometheus::Opts::new(
-						"parachain_notification_bytes_sent_total",
+						"polkadot_parachain_notification_bytes_sent_total",
 						"The number of bytes sent on a parachain notification protocol",
 					),
 					&["protocol"]
@@ -276,7 +301,6 @@ pub struct NetworkBridge<N, AD> {
 	/// `Network` trait implementing type.
 	network_service: N,
 	authority_discovery_service: AD,
-	request_multiplexer: RequestMultiplexer,
 	sync_oracle: Box<dyn SyncOracle + Send>,
 	metrics: Metrics,
 }
@@ -289,17 +313,10 @@ impl<N, AD> NetworkBridge<N, AD> {
 	pub fn new(
 		network_service: N,
 		authority_discovery_service: AD,
-		request_multiplexer: RequestMultiplexer,
 		sync_oracle: Box<dyn SyncOracle + Send>,
 		metrics: Metrics,
 	) -> Self {
-		NetworkBridge {
-			network_service,
-			authority_discovery_service,
-			request_multiplexer,
-			sync_oracle,
-			metrics,
-		}
+		NetworkBridge { network_service, authority_discovery_service, sync_oracle, metrics }
 	}
 }
 
@@ -327,6 +344,7 @@ where
 struct PeerData {
 	/// The Latest view sent by the peer.
 	view: View,
+	version: ProtocolVersion,
 }
 
 #[derive(Debug)]
@@ -335,8 +353,6 @@ enum UnexpectedAbort {
 	SubsystemError(SubsystemError),
 	/// The stream of incoming events concluded.
 	EventStreamConcluded,
-	/// The stream of incoming requests concluded.
-	RequestStreamConcluded,
 }
 
 impl From<SubsystemError> for UnexpectedAbort {
@@ -392,7 +408,7 @@ where
 			msg = ctx.recv().fuse() => match msg {
 				Ok(FromOverseer::Signal(OverseerSignal::ActiveLeaves(active_leaves))) => {
 					let ActiveLeavesUpdate { activated, deactivated } = active_leaves;
-					tracing::trace!(
+					gum::trace!(
 						target: LOG_TARGET,
 						action = "ActiveLeaves",
 						has_activated = activated.is_some(),
@@ -431,7 +447,7 @@ where
 					}
 				}
 				Ok(FromOverseer::Signal(OverseerSignal::BlockFinalized(_hash, number))) => {
-					tracing::trace!(
+					gum::trace!(
 						target: LOG_TARGET,
 						action = "BlockFinalized"
 					);
@@ -449,90 +465,97 @@ where
 				Ok(FromOverseer::Communication { msg }) => match msg {
 					NetworkBridgeMessage::ReportPeer(peer, rep) => {
 						if !rep.is_benefit() {
-							tracing::debug!(
+							gum::debug!(
 								target: LOG_TARGET,
 								?peer,
 								?rep,
 								action = "ReportPeer"
 							);
 						}
+
+						metrics.on_report_event();
 						network_service.report_peer(peer, rep);
 					}
 					NetworkBridgeMessage::DisconnectPeer(peer, peer_set) => {
-						tracing::trace!(
+						gum::trace!(
 							target: LOG_TARGET,
 							action = "DisconnectPeer",
 							?peer,
 							peer_set = ?peer_set,
 						);
+
 						network_service.disconnect_peer(peer, peer_set);
 					}
 					NetworkBridgeMessage::SendValidationMessage(peers, msg) => {
-						tracing::trace!(
+						gum::trace!(
 							target: LOG_TARGET,
 							action = "SendValidationMessages",
-							num_messages = 1,
+							num_messages = 1usize,
 						);
 
-						send_message(
-							&mut network_service,
-							peers,
-							PeerSet::Validation,
-							WireMessage::ProtocolMessage(msg),
-							&metrics,
-						);
+						match msg {
+							Versioned::V1(msg) => send_validation_message_v1(
+								&mut network_service,
+								peers,
+								WireMessage::ProtocolMessage(msg),
+								&metrics,
+							),
+						}
 					}
 					NetworkBridgeMessage::SendValidationMessages(msgs) => {
-						tracing::trace!(
+						gum::trace!(
 							target: LOG_TARGET,
 							action = "SendValidationMessages",
 							num_messages = %msgs.len(),
 						);
 
 						for (peers, msg) in msgs {
-							send_message(
-								&mut network_service,
-								peers,
-								PeerSet::Validation,
-								WireMessage::ProtocolMessage(msg),
-								&metrics,
-							);
+							match msg {
+								Versioned::V1(msg) => send_validation_message_v1(
+									&mut network_service,
+									peers,
+									WireMessage::ProtocolMessage(msg),
+									&metrics,
+								),
+							}
 						}
 					}
 					NetworkBridgeMessage::SendCollationMessage(peers, msg) => {
-						tracing::trace!(
+						gum::trace!(
 							target: LOG_TARGET,
 							action = "SendCollationMessages",
-							num_messages = 1,
+							num_messages = 1usize,
 						);
 
-						send_message(
-							&mut network_service,
-							peers,
-							PeerSet::Collation,
-							WireMessage::ProtocolMessage(msg),
-							&metrics,
-						);
+						match msg {
+							Versioned::V1(msg) => send_collation_message_v1(
+								&mut network_service,
+								peers,
+								WireMessage::ProtocolMessage(msg),
+								&metrics,
+							),
+						}
 					}
 					NetworkBridgeMessage::SendCollationMessages(msgs) => {
-						tracing::trace!(
+						gum::trace!(
 							target: LOG_TARGET,
 							action = "SendCollationMessages",
 							num_messages = %msgs.len(),
 						);
 
 						for (peers, msg) in msgs {
-							send_message(
-								&mut network_service,
-								peers,
-								PeerSet::Collation,
-								WireMessage::ProtocolMessage(msg),
-								&metrics,
-							);
+							match msg {
+								Versioned::V1(msg) => send_collation_message_v1(
+									&mut network_service,
+									peers,
+									WireMessage::ProtocolMessage(msg),
+									&metrics,
+								),
+							}
 						}
 					}
 					NetworkBridgeMessage::SendRequests(reqs, if_disconnected) => {
-						tracing::trace!(
+						gum::trace!(
 							target: LOG_TARGET,
 							action = "SendRequests",
 							num_requests = %reqs.len(),
@@ -549,7 +572,7 @@ where
 						peer_set,
 						failed,
 					} => {
-						tracing::trace!(
+						gum::trace!(
 							target: LOG_TARGET,
 							action = "ConnectToValidators",
 							peer_set = ?peer_set,
@@ -570,31 +593,58 @@ where
 						network_service = ns;
 						authority_discovery_service = ads;
 					}
-					NetworkBridgeMessage::NewGossipTopology {
-						our_neighbors,
+					NetworkBridgeMessage::ConnectToResolvedValidators {
+						validator_addrs,
+						peer_set,
 					} => {
-						tracing::debug!(
+						gum::trace!(
+							target: LOG_TARGET,
+							action = "ConnectToPeers",
+							peer_set = ?peer_set,
+							?validator_addrs,
+							"Received a resolved validator connection request",
+						);
+
+						metrics.note_desired_peer_count(peer_set, validator_addrs.len());
+
+						let all_addrs = validator_addrs.into_iter().flatten().collect();
+						network_service = validator_discovery.on_resolved_request(
+							all_addrs,
+							peer_set,
+							network_service,
+						).await;
+					}
+					NetworkBridgeMessage::NewGossipTopology {
+						session,
+						our_neighbors_x,
+						our_neighbors_y,
+					} => {
+						gum::debug!(
 							target: LOG_TARGET,
 							action = "NewGossipTopology",
-							neighbors = our_neighbors.len(),
+							neighbors_x = our_neighbors_x.len(),
+							neighbors_y = our_neighbors_y.len(),
 							"Gossip topology has changed",
 						);
 
-						let ads = &mut authority_discovery_service;
-						let mut gossip_peers = HashSet::with_capacity(our_neighbors.len());
-						for authority in our_neighbors {
-							let addr = get_peer_id_by_authority_id(
-								ads,
-								authority.clone(),
-							).await;
+						let gossip_peers_x = update_gossip_peers_1d(
+							&mut authority_discovery_service,
+							our_neighbors_x,
+						).await;
 
-							if let Some(peer_id) = addr {
-								gossip_peers.insert(peer_id);
-							}
-						}
+						let gossip_peers_y = update_gossip_peers_1d(
+							&mut authority_discovery_service,
+							our_neighbors_y,
+						).await;
 
 						dispatch_validation_event_to_all_unbounded(
-							NetworkBridgeEvent::NewGossipTopology(gossip_peers),
+							NetworkBridgeEvent::NewGossipTopology(
+								NewGossipTopology {
+									session,
+									our_neighbors_x: gossip_peers_x,
+									our_neighbors_y: gossip_peers_y,
+								}
+							),
 							ctx.sender(),
 						);
 					}
@@ -605,252 +655,365 @@ where
 	}
 }
 
+async fn update_gossip_peers_1d<AD, N>(
+	ads: &mut AD,
+	neighbors: N,
+) -> HashMap<AuthorityDiscoveryId, TopologyPeerInfo>
+where
+	AD: validator_discovery::AuthorityDiscovery,
+	N: IntoIterator<Item = (AuthorityDiscoveryId, ValidatorIndex)>,
+	N::IntoIter: std::iter::ExactSizeIterator,
+{
+	let neighbors = neighbors.into_iter();
+	let mut peers = HashMap::with_capacity(neighbors.len());
+	for (authority, validator_index) in neighbors {
+		let addr = get_peer_id_by_authority_id(ads, authority.clone()).await;
+
+		if let Some(peer_id) = addr {
+			peers.insert(authority, TopologyPeerInfo { peer_ids: vec![peer_id], validator_index });
+		}
+	}
+
+	peers
+}
+
 async fn handle_network_messages<AD: validator_discovery::AuthorityDiscovery>(
 	mut sender: impl SubsystemSender,
 	mut network_service: impl Network,
 	network_stream: BoxStream<'static, NetworkEvent>,
 	mut authority_discovery_service: AD,
-	mut request_multiplexer: RequestMultiplexer,
 	metrics: Metrics,
 	shared: Shared,
 ) -> Result<(), UnexpectedAbort> {
 	let mut network_stream = network_stream.fuse();
 	loop {
-		futures::select! {
-			network_event = network_stream.next() => match network_event {
-				None => return Err(UnexpectedAbort::EventStreamConcluded),
-				Some(NetworkEvent::Dht(_))
-				| Some(NetworkEvent::SyncConnected { .. })
-				| Some(NetworkEvent::SyncDisconnected { .. }) => {}
-				Some(NetworkEvent::NotificationStreamOpened { remote: peer, protocol, role, .. }) => {
-					let role = ObservedRole::from(role);
-					let peer_set = match PeerSet::try_from_protocol_name(&protocol) {
+		match network_stream.next().await {
+			None => return Err(UnexpectedAbort::EventStreamConcluded),
+			Some(NetworkEvent::Dht(_)) |
+			Some(NetworkEvent::SyncConnected { .. }) |
+			Some(NetworkEvent::SyncDisconnected { .. }) => {},
+			Some(NetworkEvent::NotificationStreamOpened {
+				remote: peer,
+				protocol,
+				role,
+				negotiated_fallback,
+			}) => {
+				let role = ObservedRole::from(role);
+				let (peer_set, version) = {
+					let (peer_set, version) = match PeerSet::try_from_protocol_name(&protocol) {
 						None => continue,
-						Some(peer_set) => peer_set,
+						Some(p) => p,
 					};
 
-					tracing::debug!(
-						target: LOG_TARGET,
-						action = "PeerConnected",
-						peer_set = ?peer_set,
-						peer = ?peer,
-						role = ?role
-					);
-
-					let local_view = {
-						let mut shared = shared.0.lock();
-						let peer_map = match peer_set {
-							PeerSet::Validation => &mut shared.validation_peers,
-							PeerSet::Collation => &mut shared.collation_peers,
-						};
-
-						match peer_map.entry(peer.clone()) {
-							hash_map::Entry::Occupied(_) => continue,
-							hash_map::Entry::Vacant(vacant) => {
-								vacant.insert(PeerData { view: View::default() });
-							}
-						}
-
-						metrics.on_peer_connected(peer_set);
-						metrics.note_peer_count(peer_set, peer_map.len());
-
-						shared.local_view.clone().unwrap_or(View::default())
-					};
-
-					let maybe_authority =
-						authority_discovery_service
-							.get_authority_id_by_peer_id(peer).await;
-
-					match peer_set {
-						PeerSet::Validation => {
-							dispatch_validation_events_to_all(
-								vec![
-									NetworkBridgeEvent::PeerConnected(peer.clone(), role, maybe_authority),
-									NetworkBridgeEvent::PeerViewChange(
-										peer.clone(),
-										View::default(),
-									),
-								],
-								&mut sender,
-							).await;
-
-							send_message(
-								&mut network_service,
-								vec![peer],
-								PeerSet::Validation,
-								WireMessage::<protocol_v1::ValidationProtocol>::ViewUpdate(
-									local_view,
-								),
-								&metrics,
-							);
-						}
-						PeerSet::Collation => {
-							dispatch_collation_events_to_all(
-								vec![
-									NetworkBridgeEvent::PeerConnected(peer.clone(), role, maybe_authority),
-									NetworkBridgeEvent::PeerViewChange(
-										peer.clone(),
-										View::default(),
-									),
-								],
-								&mut sender,
-							).await;
-
-							send_message(
-								&mut network_service,
-								vec![peer],
-								PeerSet::Collation,
-								WireMessage::<protocol_v1::CollationProtocol>::ViewUpdate(
-									local_view,
-								),
-								&metrics,
-							);
-						}
-					}
-				}
-				Some(NetworkEvent::NotificationStreamClosed { remote: peer, protocol }) => {
-					let peer_set = match PeerSet::try_from_protocol_name(&protocol) {
-						None => continue,
-						Some(peer_set) => peer_set,
-					};
-
-					tracing::debug!(
-						target: LOG_TARGET,
-						action = "PeerDisconnected",
-						peer_set = ?peer_set,
-						peer = ?peer
-					);
-
-					let was_connected = {
-						let mut shared = shared.0.lock();
-						let peer_map = match peer_set {
-							PeerSet::Validation => &mut shared.validation_peers,
-							PeerSet::Collation => &mut shared.collation_peers,
-						};
-
-						let w = peer_map.remove(&peer).is_some();
-
-						metrics.on_peer_disconnected(peer_set);
-						metrics.note_peer_count(peer_set, peer_map.len());
-
-						w
-					};
-
-					if was_connected {
-						match peer_set {
-							PeerSet::Validation => dispatch_validation_event_to_all(
-								NetworkBridgeEvent::PeerDisconnected(peer),
-								&mut sender,
-							).await,
-							PeerSet::Collation => dispatch_collation_event_to_all(
-								NetworkBridgeEvent::PeerDisconnected(peer),
-								&mut sender,
-							).await,
-						}
-					}
-				}
-				Some(NetworkEvent::NotificationsReceived { remote, messages }) => {
-					let v_messages: Result<Vec<_>, _> = messages
-						.iter()
-						.filter(|(protocol, _)| {
-							protocol == &PeerSet::Validation.into_protocol_name()
-						})
-						.map(|(_, msg_bytes)| {
-							WireMessage::decode(&mut msg_bytes.as_ref())
-								.map(|m| (m, msg_bytes.len()))
-						})
-						.collect();
-
-					let v_messages = match v_messages {
-						Err(_) => {
-							tracing::debug!(
-								target: LOG_TARGET,
-								action = "ReportPeer"
-							);
-
-							network_service.report_peer(remote, MALFORMED_MESSAGE_COST);
-							continue;
-						}
-						Ok(v) => v,
-					};
-
-					let c_messages: Result<Vec<_>, _> = messages
-						.iter()
-						.filter(|(protocol, _)| {
-							protocol == &PeerSet::Collation.into_protocol_name()
-						})
-						.map(|(_, msg_bytes)| {
-							WireMessage::decode(&mut msg_bytes.as_ref())
-								.map(|m| (m, msg_bytes.len()))
-						})
-						.collect();
-
-					match c_messages {
-						Err(_) => {
-							tracing::debug!(
-								target: LOG_TARGET,
-								action = "ReportPeer"
-							);
-
-							network_service.report_peer(remote, MALFORMED_MESSAGE_COST);
-							continue;
-						}
-						Ok(c_messages) => {
-							if v_messages.is_empty() && c_messages.is_empty() {
-								continue;
-							} else {
-								tracing::trace!(
+					if let Some(fallback) = negotiated_fallback {
+						match PeerSet::try_from_protocol_name(&fallback) {
+							None => {
+								gum::debug!(
 									target: LOG_TARGET,
-									action = "PeerMessages",
-									peer = ?remote,
-									num_validation_messages = %v_messages.len(),
-									num_collation_messages = %c_messages.len()
+									fallback = &*fallback,
+									?peer,
+									?peer_set,
+									"Unknown fallback",
 								);
 
-								if !v_messages.is_empty() {
-									let (events, reports) = handle_peer_messages(
-										remote.clone(),
-										PeerSet::Validation,
-										&mut shared.0.lock().validation_peers,
-										v_messages,
-										&metrics,
+								continue
+							},
+							Some((p2, v2)) => {
+								if p2 != peer_set {
+									gum::debug!(
+										target: LOG_TARGET,
+										fallback = &*fallback,
+										fallback_peerset = ?p2,
+										protocol = &*protocol,
+										peerset = ?peer_set,
+										"Fallback mismatched peer-set",
 									);
 
-									for report in reports {
-										network_service.report_peer(remote.clone(), report);
-									}
-
-									dispatch_validation_events_to_all(events, &mut sender).await;
+									continue
 								}
 
-								if !c_messages.is_empty() {
-									let (events, reports) = handle_peer_messages(
-										remote.clone(),
-										PeerSet::Collation,
-										&mut shared.0.lock().collation_peers,
-										c_messages,
-										&metrics,
-									);
-
-									for report in reports {
-										network_service.report_peer(remote.clone(), report);
-									}
-
-
-									dispatch_collation_events_to_all(events, &mut sender).await;
-								}
-							}
+								(p2, v2)
+							},
 						}
+					} else {
+						(peer_set, version)
+					}
+				};
+
+				gum::debug!(
+					target: LOG_TARGET,
+					action = "PeerConnected",
+					peer_set = ?peer_set,
+					version,
+					peer = ?peer,
+					role = ?role
+				);
+
+				let local_view = {
+					let mut shared = shared.0.lock();
+					let peer_map = match peer_set {
+						PeerSet::Validation => &mut shared.validation_peers,
+						PeerSet::Collation => &mut shared.collation_peers,
+					};
+
+					match peer_map.entry(peer.clone()) {
+						hash_map::Entry::Occupied(_) => continue,
+						hash_map::Entry::Vacant(vacant) => {
+							vacant.insert(PeerData { view: View::default(), version });
+						},
+					}
+
+					metrics.on_peer_connected(peer_set, version);
+					metrics.note_peer_count(peer_set, version, peer_map.len());
+
+					shared.local_view.clone().unwrap_or(View::default())
+				};
+
+				let maybe_authority =
+					authority_discovery_service.get_authority_ids_by_peer_id(peer).await;
+
+				match peer_set {
+					PeerSet::Validation => {
+						dispatch_validation_events_to_all(
+							vec![
+								NetworkBridgeEvent::PeerConnected(
+									peer.clone(),
+									role,
+									1,
+									maybe_authority,
+								),
+								NetworkBridgeEvent::PeerViewChange(peer.clone(), View::default()),
+							],
+							&mut sender,
+						)
+						.await;
+
+						send_message(
+							&mut network_service,
+							vec![peer],
+							PeerSet::Validation,
+							version,
+							WireMessage::<protocol_v1::ValidationProtocol>::ViewUpdate(local_view),
+							&metrics,
+						);
+					},
+					PeerSet::Collation => {
+						dispatch_collation_events_to_all(
+							vec![
+								NetworkBridgeEvent::PeerConnected(
+									peer.clone(),
+									role,
+									1,
+									maybe_authority,
+								),
+								NetworkBridgeEvent::PeerViewChange(peer.clone(), View::default()),
+							],
+							&mut sender,
+						)
+						.await;
+
+						send_message(
+							&mut network_service,
+							vec![peer],
+							PeerSet::Collation,
+							version,
+							WireMessage::<protocol_v1::CollationProtocol>::ViewUpdate(local_view),
+							&metrics,
+						);
+					},
+				}
+			},
+			Some(NetworkEvent::NotificationStreamClosed { remote: peer, protocol }) => {
+				let (peer_set, version) = match PeerSet::try_from_protocol_name(&protocol) {
+					None => continue,
+					Some(peer_set) => peer_set,
+				};
+
+				gum::debug!(
+					target: LOG_TARGET,
+					action = "PeerDisconnected",
+					peer_set = ?peer_set,
+					peer = ?peer
+				);
+
+				let was_connected = {
+					let mut shared = shared.0.lock();
+					let peer_map = match peer_set {
+						PeerSet::Validation => &mut shared.validation_peers,
+						PeerSet::Collation => &mut shared.collation_peers,
+					};
+
+					let w = peer_map.remove(&peer).is_some();
+
+					metrics.on_peer_disconnected(peer_set, version);
+					metrics.note_peer_count(peer_set, version, peer_map.len());
+
+					w
+				};
+
+				if was_connected && version == peer_set.get_default_version() {
+					match peer_set {
+						PeerSet::Validation =>
+							dispatch_validation_event_to_all(
+								NetworkBridgeEvent::PeerDisconnected(peer),
+								&mut sender,
+							)
+							.await,
+						PeerSet::Collation =>
+							dispatch_collation_event_to_all(
+								NetworkBridgeEvent::PeerDisconnected(peer),
+								&mut sender,
+							)
+							.await,
 					}
 				}
 			},
-			req_res_event = request_multiplexer.next() => match req_res_event {
-				None => return Err(UnexpectedAbort::RequestStreamConcluded),
-				Some(Err(err)) => {
-					network_service.report_peer(err.peer, MALFORMED_MESSAGE_COST);
+			Some(NetworkEvent::NotificationsReceived { remote, messages }) => {
+				let expected_versions = {
+					let mut versions = PerPeerSet::<Option<ProtocolVersion>>::default();
+					let shared = shared.0.lock();
+					if let Some(peer_data) = shared.validation_peers.get(&remote) {
+						versions[PeerSet::Validation] = Some(peer_data.version);
+					}
+
+					if let Some(peer_data) = shared.collation_peers.get(&remote) {
+						versions[PeerSet::Collation] = Some(peer_data.version);
+					}
+
+					versions
+				};
+
+				// non-decoded, but version-checked validation messages.
+				let v_messages: Result<Vec<_>, _> = messages
+					.iter()
+					.filter_map(|(protocol, msg_bytes)| {
+						// version doesn't matter because we always receive on the 'correct'
+						// protocol name, not the negotiated fallback.
+						let (peer_set, _version) = PeerSet::try_from_protocol_name(protocol)?;
+						if peer_set == PeerSet::Validation {
+							if expected_versions[PeerSet::Validation].is_none() {
+								return Some(Err(UNCONNECTED_PEERSET_COST))
+							}
+
+							Some(Ok(msg_bytes.clone()))
+						} else {
+							None
+						}
+					})
+					.collect();
+
+				let v_messages = match v_messages {
+					Err(rep) => {
+						gum::debug!(target: LOG_TARGET, action = "ReportPeer");
+						network_service.report_peer(remote, rep);
+
+						continue
+					},
+					Ok(v) => v,
+				};
+
+				// non-decoded, but version-checked colldation messages.
+				let c_messages: Result<Vec<_>, _> = messages
+					.iter()
+					.filter_map(|(protocol, msg_bytes)| {
+						// version doesn't matter because we always receive on the 'correct'
+						// protocol name, not the negotiated fallback.
+						let (peer_set, _version) = PeerSet::try_from_protocol_name(protocol)?;
+
+						if peer_set == PeerSet::Collation {
+							if expected_versions[PeerSet::Collation].is_none() {
+								return Some(Err(UNCONNECTED_PEERSET_COST))
+							}
+
+							Some(Ok(msg_bytes.clone()))
+						} else {
+							None
+						}
+					})
+					.collect();
+
+				let c_messages = match c_messages {
+					Err(rep) => {
+						gum::debug!(target: LOG_TARGET, action = "ReportPeer");
+						network_service.report_peer(remote, rep);
+
+						continue
+					},
+					Ok(v) => v,
+				};
+
+				if v_messages.is_empty() && c_messages.is_empty() {
+					continue
 				}
-				Some(Ok(msg)) => {
-					sender.send_message(msg).await;
+
+				gum::trace!(
+					target: LOG_TARGET,
+					action = "PeerMessages",
+					peer = ?remote,
+					num_validation_messages = %v_messages.len(),
+					num_collation_messages = %c_messages.len()
+				);
+
+				if !v_messages.is_empty() {
+					let (events, reports) =
+						if expected_versions[PeerSet::Validation] == Some(1) {
+							handle_v1_peer_messages::<protocol_v1::ValidationProtocol, _>(
+								remote.clone(),
+								PeerSet::Validation,
+								&mut shared.0.lock().validation_peers,
+								v_messages,
+								&metrics,
+							)
+						} else {
+							gum::warn!(
+								target: LOG_TARGET,
+								version = ?expected_versions[PeerSet::Validation],
+								"Major logic bug. Peer somehow has unsupported validation protocol version."
+							);
+
+							never!("Only version 1 is supported; peer set connection checked above; qed");
+
+							// If a peer somehow triggers this, we'll disconnect them
+							// eventually.
+							(Vec::new(), vec![UNCONNECTED_PEERSET_COST])
+						};
+
+					for report in reports {
+						network_service.report_peer(remote.clone(), report);
+					}
+
+					dispatch_validation_events_to_all(events, &mut sender).await;
+				}
+
+				if !c_messages.is_empty() {
+					let (events, reports) =
+						if expected_versions[PeerSet::Collation] == Some(1) {
+							handle_v1_peer_messages::<protocol_v1::CollationProtocol, _>(
+								remote.clone(),
+								PeerSet::Collation,
+								&mut shared.0.lock().collation_peers,
+								c_messages,
+								&metrics,
+							)
+						} else {
+							gum::warn!(
+								target: LOG_TARGET,
+								version = ?expected_versions[PeerSet::Collation],
+								"Major logic bug. Peer somehow has unsupported collation protocol version."
+							);
+
+							never!("Only version 1 is supported; peer set connection checked above; qed");
+
+							// If a peer somehow triggers this, we'll disconnect them
+							// eventually.
+							(Vec::new(), vec![UNCONNECTED_PEERSET_COST])
+						};
+
+					for report in reports {
+						network_service.report_peer(remote.clone(), report);
+					}
+
+					dispatch_collation_events_to_all(events, &mut sender).await;
 				}
 			},
 		}
@@ -881,39 +1044,20 @@ where
 {
 	let shared = Shared::default();
 
-	let NetworkBridge {
-		network_service,
-		mut request_multiplexer,
-		authority_discovery_service,
-		metrics,
-		sync_oracle,
-	} = bridge;
-
-	let statement_receiver = request_multiplexer
-		.get_statement_fetching()
-		.expect("Gets initialized, must be `Some` on startup. qed.");
-
-	let dispute_receiver = request_multiplexer
-		.get_dispute_sending()
-		.expect("Gets initialized, must be `Some` on startup. qed.");
+	let NetworkBridge { network_service, authority_discovery_service, metrics, sync_oracle } =
+		bridge;
 
 	let (remote, network_event_handler) = handle_network_messages(
 		ctx.sender().clone(),
 		network_service.clone(),
 		network_stream,
 		authority_discovery_service.clone(),
-		request_multiplexer,
 		metrics.clone(),
 		shared.clone(),
 	)
 	.remote_handle();
 
 	ctx.spawn("network-bridge-network-worker", Box::pin(remote))?;
-
-	ctx.send_message(DisputeDistributionMessage::DisputeSendingReceiver(dispute_receiver))
-		.await;
-	ctx.send_message(StatementDistributionMessage::StatementFetchingReceiver(statement_receiver))
-		.await;
 
 	let subsystem_event_handler = handle_subsystem_messages(
 		ctx,
@@ -933,7 +1077,7 @@ where
 	{
 		Ok(()) => Ok(()),
 		Err(UnexpectedAbort::SubsystemError(err)) => {
-			tracing::warn!(
+			gum::warn!(
 				target: LOG_TARGET,
 				err = ?err,
 				"Shutting down Network Bridge due to error"
@@ -945,18 +1089,11 @@ where
 			)))
 		},
 		Err(UnexpectedAbort::EventStreamConcluded) => {
-			tracing::info!(
+			gum::info!(
 				target: LOG_TARGET,
 				"Shutting down Network Bridge: underlying request stream concluded"
 			);
 			Err(SubsystemError::Context("Incoming network event stream concluded.".to_string()))
-		},
-		Err(UnexpectedAbort::RequestStreamConcluded) => {
-			tracing::info!(
-				target: LOG_TARGET,
-				"Shutting down Network Bridge: underlying request stream concluded"
-			);
-			Err(SubsystemError::Context("Incoming network request stream concluded".to_string()))
 		},
 	}
 }
@@ -1003,14 +1140,14 @@ fn update_our_view(
 		)
 	};
 
-	send_validation_message(
+	send_validation_message_v1(
 		net,
 		validation_peers,
 		WireMessage::ViewUpdate(new_view.clone()),
 		metrics,
 	);
 
-	send_collation_message(net, collation_peers, WireMessage::ViewUpdate(new_view), metrics);
+	send_collation_message_v1(net, collation_peers, WireMessage::ViewUpdate(new_view), metrics);
 
 	let our_view = OurView::new(
 		live_heads.iter().take(MAX_VIEW_HEADS).cloned().map(|a| (a.hash, a.span)),
@@ -1028,27 +1165,34 @@ fn update_our_view(
 	);
 }
 
-// Handle messages on a specific peer-set. The peer is expected to be connected on that
+// Handle messages on a specific v1 peer-set. The peer is expected to be connected on that
 // peer-set.
-fn handle_peer_messages<M>(
+fn handle_v1_peer_messages<RawMessage: Decode, OutMessage: From<RawMessage>>(
 	peer: PeerId,
 	peer_set: PeerSet,
 	peers: &mut HashMap<PeerId, PeerData>,
-	messages: Vec<(WireMessage<M>, usize)>,
+	messages: Vec<Bytes>,
 	metrics: &Metrics,
-) -> (Vec<NetworkBridgeEvent<M>>, Vec<Rep>) {
+) -> (Vec<NetworkBridgeEvent<OutMessage>>, Vec<Rep>) {
 	let peer_data = match peers.get_mut(&peer) {
 		None => return (Vec::new(), vec![UNCONNECTED_PEERSET_COST]),
 		Some(d) => d,
 	};
 
-	let mut outgoing_messages = Vec::with_capacity(messages.len());
+	let mut outgoing_events = Vec::with_capacity(messages.len());
 	let mut reports = Vec::new();
 
-	for (message, size_bytes) in messages {
-		metrics.on_notification_received(peer_set, size_bytes);
+	for message in messages {
+		metrics.on_notification_received(peer_set, peer_data.version, message.len());
+		let message = match WireMessage::<RawMessage>::decode_all(&mut message.as_ref()) {
+			Err(_) => {
+				reports.push(MALFORMED_MESSAGE_COST);
+				continue
+			},
+			Ok(m) => m,
+		};
 
-		outgoing_messages.push(match message {
+		outgoing_events.push(match message {
 			WireMessage::ViewUpdate(new_view) => {
 				if new_view.len() > MAX_VIEW_HEADS ||
 					new_view.finalized_number < peer_data.view.finalized_number
@@ -1067,47 +1211,47 @@ fn handle_peer_messages<M>(
 				}
 			},
 			WireMessage::ProtocolMessage(message) =>
-				NetworkBridgeEvent::PeerMessage(peer.clone(), message),
+				NetworkBridgeEvent::PeerMessage(peer.clone(), message.into()),
 		})
 	}
 
-	(outgoing_messages, reports)
+	(outgoing_events, reports)
 }
 
-fn send_validation_message(
+fn send_validation_message_v1(
 	net: &mut impl Network,
 	peers: Vec<PeerId>,
 	message: WireMessage<protocol_v1::ValidationProtocol>,
 	metrics: &Metrics,
 ) {
-	send_message(net, peers, PeerSet::Validation, message, metrics);
+	send_message(net, peers, PeerSet::Validation, 1, message, metrics);
 }
 
-fn send_collation_message(
+fn send_collation_message_v1(
 	net: &mut impl Network,
 	peers: Vec<PeerId>,
 	message: WireMessage<protocol_v1::CollationProtocol>,
 	metrics: &Metrics,
 ) {
-	send_message(net, peers, PeerSet::Collation, message, metrics)
+	send_message(net, peers, PeerSet::Collation, 1, message, metrics)
 }
 
 async fn dispatch_validation_event_to_all(
-	event: NetworkBridgeEvent<protocol_v1::ValidationProtocol>,
+	event: NetworkBridgeEvent<net_protocol::VersionedValidationProtocol>,
 	ctx: &mut impl SubsystemSender,
 ) {
 	dispatch_validation_events_to_all(std::iter::once(event), ctx).await
 }
 
 async fn dispatch_collation_event_to_all(
-	event: NetworkBridgeEvent<protocol_v1::CollationProtocol>,
+	event: NetworkBridgeEvent<net_protocol::VersionedCollationProtocol>,
 	ctx: &mut impl SubsystemSender,
 ) {
 	dispatch_collation_events_to_all(std::iter::once(event), ctx).await
 }
 
 fn dispatch_validation_event_to_all_unbounded(
-	event: NetworkBridgeEvent<protocol_v1::ValidationProtocol>,
+	event: NetworkBridgeEvent<net_protocol::VersionedValidationProtocol>,
 	ctx: &mut impl SubsystemSender,
 ) {
 	for msg in AllMessages::dispatch_iter(event) {
@@ -1116,17 +1260,17 @@ fn dispatch_validation_event_to_all_unbounded(
 }
 
 fn dispatch_collation_event_to_all_unbounded(
-	event: NetworkBridgeEvent<protocol_v1::CollationProtocol>,
+	event: NetworkBridgeEvent<net_protocol::VersionedCollationProtocol>,
 	ctx: &mut impl SubsystemSender,
 ) {
-	if let Some(msg) = event.focus().ok().map(CollatorProtocolMessage::NetworkBridgeUpdateV1) {
+	if let Some(msg) = event.focus().ok().map(CollatorProtocolMessage::NetworkBridgeUpdate) {
 		ctx.send_unbounded_message(msg.into());
 	}
 }
 
 async fn dispatch_validation_events_to_all<I>(events: I, ctx: &mut impl SubsystemSender)
 where
-	I: IntoIterator<Item = NetworkBridgeEvent<protocol_v1::ValidationProtocol>>,
+	I: IntoIterator<Item = NetworkBridgeEvent<net_protocol::VersionedValidationProtocol>>,
 	I::IntoIter: Send,
 {
 	ctx.send_messages(events.into_iter().flat_map(AllMessages::dispatch_iter)).await
@@ -1134,13 +1278,14 @@ where
 
 async fn dispatch_collation_events_to_all<I>(events: I, ctx: &mut impl SubsystemSender)
 where
-	I: IntoIterator<Item = NetworkBridgeEvent<protocol_v1::CollationProtocol>>,
+	I: IntoIterator<Item = NetworkBridgeEvent<net_protocol::VersionedCollationProtocol>>,
 	I::IntoIter: Send,
 {
-	let messages_for = |event: NetworkBridgeEvent<protocol_v1::CollationProtocol>| {
-		event.focus().ok().map(|m| {
-			AllMessages::CollatorProtocol(CollatorProtocolMessage::NetworkBridgeUpdateV1(m))
-		})
+	let messages_for = |event: NetworkBridgeEvent<net_protocol::VersionedCollationProtocol>| {
+		event
+			.focus()
+			.ok()
+			.map(|m| AllMessages::CollatorProtocol(CollatorProtocolMessage::NetworkBridgeUpdate(m)))
 	};
 
 	ctx.send_messages(events.into_iter().flat_map(messages_for)).await

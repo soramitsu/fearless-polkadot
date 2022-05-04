@@ -14,15 +14,13 @@
 // You should have received a copy of the GNU General Public License
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::convert::TryInto;
-
 use parity_scale_codec::{Decode, Encode};
 
 use sp_application_crypto::AppKey;
 use sp_keystore::{CryptoStore, Error as KeystoreError, SyncCryptoStorePtr};
 
 use super::{Statement, UncheckedSignedFullStatement};
-use polkadot_primitives::v1::{
+use polkadot_primitives::v2::{
 	CandidateHash, CandidateReceipt, DisputeStatement, InvalidDisputeStatementKind, SessionIndex,
 	SigningContext, ValidDisputeStatementKind, ValidatorId, ValidatorIndex, ValidatorSignature,
 };
@@ -66,6 +64,26 @@ impl CandidateVotes {
 }
 
 impl SignedDisputeStatement {
+	/// Create a new `SignedDisputeStatement` from information
+	/// that is available on-chain, and hence already can be trusted.
+	///
+	/// Attention: Not to be used other than with guaranteed fetches.
+	pub fn new_unchecked_from_trusted_source(
+		dispute_statement: DisputeStatement,
+		candidate_hash: CandidateHash,
+		session_index: SessionIndex,
+		validator_public: ValidatorId,
+		validator_signature: ValidatorSignature,
+	) -> Self {
+		SignedDisputeStatement {
+			dispute_statement,
+			candidate_hash,
+			validator_public,
+			validator_signature,
+			session_index,
+		}
+	}
+
 	/// Create a new `SignedDisputeStatement`, which is only possible by checking the signature.
 	pub fn new_checked(
 		dispute_statement: DisputeStatement,

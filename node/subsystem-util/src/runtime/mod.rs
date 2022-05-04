@@ -22,17 +22,19 @@ use lru::LruCache;
 
 use parity_scale_codec::Encode;
 use sp_application_crypto::AppKey;
-use sp_core::crypto::Public;
+use sp_core::crypto::ByteArray;
 use sp_keystore::{CryptoStore, SyncCryptoStorePtr};
 
 use polkadot_node_subsystem::{SubsystemContext, SubsystemSender};
-use polkadot_primitives::v1::{
-	CoreState, EncodeAs, GroupIndex, GroupRotationInfo, Hash, OccupiedCore, SessionIndex,
-	SessionInfo, Signed, SigningContext, UncheckedSigned, ValidatorId, ValidatorIndex,
+use polkadot_primitives::v2::{
+	CandidateEvent, CoreState, EncodeAs, GroupIndex, GroupRotationInfo, Hash, OccupiedCore,
+	ScrapedOnChainVotes, SessionIndex, SessionInfo, Signed, SigningContext, UncheckedSigned,
+	ValidationCode, ValidationCodeHash, ValidatorId, ValidatorIndex,
 };
 
 use crate::{
-	request_availability_cores, request_session_index_for_child, request_session_info,
+	request_availability_cores, request_candidate_events, request_on_chain_votes,
+	request_session_index_for_child, request_session_info, request_validation_code_by_hash,
 	request_validator_groups,
 };
 
@@ -40,7 +42,7 @@ use crate::{
 mod error;
 
 use error::{recv_runtime, Result};
-pub use error::{Error, Fatal, NonFatal};
+pub use error::{Error, FatalError, JfyiError};
 
 /// Configuration for construction a `RuntimeInfo`.
 pub struct Config {
@@ -113,8 +115,9 @@ impl RuntimeInfo {
 		}
 	}
 
-	/// Retrieve the current session index.
-	pub async fn get_session_index<Sender>(
+	/// Returns the session index expected at any child of the `parent` block.
+	/// This does not return the session index for the `parent` block.
+	pub async fn get_session_index_for_child<Sender>(
 		&mut self,
 		sender: &mut Sender,
 		parent: Hash,
@@ -137,14 +140,14 @@ impl RuntimeInfo {
 	pub async fn get_session_info<'a, Sender>(
 		&'a mut self,
 		sender: &mut Sender,
-		parent: Hash,
+		relay_parent: Hash,
 	) -> Result<&'a ExtendedSessionInfo>
 	where
 		Sender: SubsystemSender,
 	{
-		let session_index = self.get_session_index(sender, parent).await?;
+		let session_index = self.get_session_index_for_child(sender, relay_parent).await?;
 
-		self.get_session_info_by_index(sender, parent, session_index).await
+		self.get_session_info_by_index(sender, relay_parent, session_index).await
 	}
 
 	/// Get `ExtendedSessionInfo` by session index.
@@ -164,7 +167,7 @@ impl RuntimeInfo {
 			let session_info =
 				recv_runtime(request_session_info(parent, session_index, sender).await)
 					.await?
-					.ok_or(NonFatal::NoSuchSession(session_index))?;
+					.ok_or(JfyiError::NoSuchSession(session_index))?;
 			let validator_info = self.get_validator_info(&session_info).await?;
 
 			let full_info = ExtendedSessionInfo { session_info, validator_info };
@@ -181,7 +184,7 @@ impl RuntimeInfo {
 	pub async fn check_signature<Sender, Payload, RealPayload>(
 		&mut self,
 		sender: &mut Sender,
-		parent: Hash,
+		relay_parent: Hash,
 		signed: UncheckedSigned<Payload, RealPayload>,
 	) -> Result<
 		std::result::Result<Signed<Payload, RealPayload>, UncheckedSigned<Payload, RealPayload>>,
@@ -191,15 +194,15 @@ impl RuntimeInfo {
 		Payload: EncodeAs<RealPayload> + Clone,
 		RealPayload: Encode + Clone,
 	{
-		let session_index = self.get_session_index(sender, parent).await?;
-		let info = self.get_session_info_by_index(sender, parent, session_index).await?;
-		Ok(check_signature(session_index, &info.session_info, parent, signed))
+		let session_index = self.get_session_index_for_child(sender, relay_parent).await?;
+		let info = self.get_session_info_by_index(sender, relay_parent, session_index).await?;
+		Ok(check_signature(session_index, &info.session_info, relay_parent, signed))
 	}
 
 	/// Build `ValidatorInfo` for the current session.
 	///
 	///
-	/// Returns: `None` if not a validator.
+	/// Returns: `None` if not a parachain validator.
 	async fn get_validator_info(&self, session_info: &SessionInfo) -> Result<ValidatorInfo> {
 		if let Some(our_index) = self.get_our_index(&session_info.validators).await {
 			// Get our group index:
@@ -299,4 +302,39 @@ where
 	let (_, info) =
 		recv_runtime(request_validator_groups(relay_parent, ctx.sender()).await).await?;
 	Ok(info)
+}
+
+/// Get `CandidateEvent`s for the given `relay_parent`.
+pub async fn get_candidate_events<Sender>(
+	sender: &mut Sender,
+	relay_parent: Hash,
+) -> Result<Vec<CandidateEvent>>
+where
+	Sender: SubsystemSender,
+{
+	recv_runtime(request_candidate_events(relay_parent, sender).await).await
+}
+
+/// Get on chain votes.
+pub async fn get_on_chain_votes<Sender>(
+	sender: &mut Sender,
+	relay_parent: Hash,
+) -> Result<Option<ScrapedOnChainVotes>>
+where
+	Sender: SubsystemSender,
+{
+	recv_runtime(request_on_chain_votes(relay_parent, sender).await).await
+}
+
+/// Fetch `ValidationCode` by hash from the runtime.
+pub async fn get_validation_code_by_hash<Sender>(
+	sender: &mut Sender,
+	relay_parent: Hash,
+	validation_code_hash: ValidationCodeHash,
+) -> Result<Option<ValidationCode>>
+where
+	Sender: SubsystemSender,
+{
+	recv_runtime(request_validation_code_by_hash(relay_parent, validation_code_hash, sender).await)
+		.await
 }

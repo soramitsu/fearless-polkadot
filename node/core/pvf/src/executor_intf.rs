@@ -22,33 +22,34 @@ use sc_executor_common::{
 };
 use sc_executor_wasmtime::{Config, DeterministicStackLimit, Semantics};
 use sp_core::storage::{ChildInfo, TrackedStorageKey};
-use sp_wasm_interface::HostFunctions as _;
 use std::any::{Any, TypeId};
 
+// Memory configuration
+//
+// When Substrate Runtime is instantiated, a number of WASM pages are allocated for the Substrate
+// Runtime instance's linear memory. The exact number of pages is a sum of whatever the WASM blob
+// itself requests (by default at least enough to hold the data section as well as have some space
+// left for the stack; this is, of course, overridable at link time when compiling the runtime)
+// plus the number of pages specified in the `extra_heap_pages` passed to the executor.
+//
+// By default, rustc (or `lld` specifically) should allocate 1 MiB for the shadow stack, or 16 pages.
+// The data section for runtimes are typically rather small and can fit in a single digit number of
+// WASM pages, so let's say an extra 16 pages. Thus let's assume that 32 pages or 2 MiB are used for
+// these needs by default.
+const DEFAULT_HEAP_PAGES_ESTIMATE: u64 = 32;
+const EXTRA_HEAP_PAGES: u64 = 2048;
+
 const CONFIG: Config = Config {
-	// Memory configuration
-	//
-	// When Substrate Runtime is instantiated, a number of wasm pages are mounted for the Substrate
-	// Runtime instance. The number of pages is specified by `heap_pages`.
-	//
-	// Besides `heap_pages` linear memory requests an initial number of pages. Those pages are
-	// typically used for placing the so-called shadow stack and the data section.
-	//
-	// By default, rustc (or lld specifically) allocates 1 MiB for the shadow stack. That is, 16
-	// wasm pages.
-	//
-	// Data section for runtimes are typically rather small and can fit in a single digit number of
-	// wasm pages.
-	//
-	// Thus let's assume that 32 pages or 2 MiB are used for these needs.
-	max_memory_pages: Some(2048 + 32),
-	heap_pages: 2048,
+	// NOTE: This is specified in bytes, so we multiply by WASM page size.
+	max_memory_size: Some(((DEFAULT_HEAP_PAGES_ESTIMATE + EXTRA_HEAP_PAGES) * 65536) as usize),
 
 	allow_missing_func_imports: true,
 	cache_path: None,
 	semantics: Semantics {
+		extra_heap_pages: EXTRA_HEAP_PAGES,
+
 		fast_instance_reuse: false,
-		// Enable determinstic stack limit to pin down the exact number of items the wasmtime stack
+		// Enable deterministic stack limit to pin down the exact number of items the wasmtime stack
 		// can contain before it traps with stack overflow.
 		//
 		// Here is how the values below were chosen.
@@ -57,7 +58,7 @@ const CONFIG: Config = Config {
 		// (see the docs about the field and the instrumentation algorithm) is 8 bytes, 1 MiB can
 		// fit 2x 65536 logical items.
 		//
-		// Since reaching the native stack limit is undesirable, we halven the logical item limit and
+		// Since reaching the native stack limit is undesirable, we halve the logical item limit and
 		// also increase the native 256x. This hopefully should preclude wasm code from reaching
 		// the stack limit set by the wasmtime.
 		deterministic_stack_limit: Some(DeterministicStackLimit {
@@ -65,6 +66,13 @@ const CONFIG: Config = Config {
 			native_stack_max: 256 * 1024 * 1024,
 		}),
 		canonicalize_nans: true,
+		// Rationale for turning the multi-threaded compilation off is to make the preparation time
+		// easily reproducible and as deterministic as possible.
+		//
+		// Currently the prepare queue doesn't distinguish between precheck and prepare requests.
+		// On the one hand, it simplifies the code, on the other, however, slows down compile times
+		// for execute requests. This behavior may change in future.
+		parallel_compilation: false,
 	},
 };
 
@@ -104,10 +112,9 @@ pub unsafe fn execute(
 	let mut ext = ValidationExternalities(extensions);
 
 	sc_executor::with_externalities_safe(&mut ext, || {
-		let runtime = sc_executor_wasmtime::create_runtime_from_artifact(
+		let runtime = sc_executor_wasmtime::create_runtime_from_artifact::<HostFunctions>(
 			compiled_artifact,
 			CONFIG,
-			HostFunctions::host_functions(),
 		)?;
 		runtime.new_instance()?.call(InvokeMethod::Export("validate_block"), params)
 	})?
@@ -162,16 +169,12 @@ impl sp_externalities::Externalities for ValidationExternalities {
 		panic!("place_child_storage: unsupported feature for parachain validation")
 	}
 
-	fn storage_root(&mut self) -> Vec<u8> {
+	fn storage_root(&mut self, _: sp_core::storage::StateVersion) -> Vec<u8> {
 		panic!("storage_root: unsupported feature for parachain validation")
 	}
 
-	fn child_storage_root(&mut self, _: &ChildInfo) -> Vec<u8> {
+	fn child_storage_root(&mut self, _: &ChildInfo, _: sp_core::storage::StateVersion) -> Vec<u8> {
 		panic!("child_storage_root: unsupported feature for parachain validation")
-	}
-
-	fn storage_changes_root(&mut self, _: &[u8]) -> Result<Option<Vec<u8>>, ()> {
-		panic!("storage_changes_root: unsupported feature for parachain validation")
 	}
 
 	fn next_child_storage_key(&self, _: &ChildInfo, _: &[u8]) -> Option<Vec<u8>> {
@@ -274,11 +277,21 @@ impl TaskExecutor {
 }
 
 impl sp_core::traits::SpawnNamed for TaskExecutor {
-	fn spawn_blocking(&self, _: &'static str, future: futures::future::BoxFuture<'static, ()>) {
+	fn spawn_blocking(
+		&self,
+		_task_name: &'static str,
+		_subsystem_name: Option<&'static str>,
+		future: futures::future::BoxFuture<'static, ()>,
+	) {
 		self.0.spawn_ok(future);
 	}
 
-	fn spawn(&self, _: &'static str, future: futures::future::BoxFuture<'static, ()>) {
+	fn spawn(
+		&self,
+		_task_name: &'static str,
+		_subsystem_name: Option<&'static str>,
+		future: futures::future::BoxFuture<'static, ()>,
+	) {
 		self.0.spawn_ok(future);
 	}
 }

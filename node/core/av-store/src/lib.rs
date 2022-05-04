@@ -28,16 +28,13 @@ use std::{
 
 use futures::{channel::oneshot, future, select, FutureExt};
 use futures_timer::Delay;
-use kvdb::{DBTransaction, KeyValueDB};
 use parity_scale_codec::{Decode, Encode, Error as CodecError, Input};
+use polkadot_node_subsystem_util::database::{DBTransaction, Database};
 
 use bitvec::{order::Lsb0 as BitOrderLsb0, vec::BitVec};
 use polkadot_node_primitives::{AvailableData, ErasureChunk};
-use polkadot_node_subsystem_util::{
-	self as util,
-	metrics::{self, prometheus},
-};
-use polkadot_primitives::v1::{
+use polkadot_node_subsystem_util as util;
+use polkadot_primitives::v2::{
 	BlockNumber, CandidateEvent, CandidateHash, CandidateReceipt, Hash, Header, ValidatorIndex,
 };
 use polkadot_subsystem::{
@@ -47,10 +44,13 @@ use polkadot_subsystem::{
 	SubsystemError,
 };
 
+mod metrics;
+pub use self::metrics::*;
+
 #[cfg(test)]
 mod tests;
 
-const LOG_TARGET: &str = "parachain::availability";
+const LOG_TARGET: &str = "parachain::availability-store";
 
 /// The following constants are used under normal conditions:
 
@@ -148,11 +148,11 @@ enum State {
 struct CandidateMeta {
 	state: State,
 	data_available: bool,
-	chunks_stored: BitVec<BitOrderLsb0, u8>,
+	chunks_stored: BitVec<u8, BitOrderLsb0>,
 }
 
 fn query_inner<D: Decode>(
-	db: &Arc<dyn KeyValueDB>,
+	db: &Arc<dyn Database>,
 	column: u32,
 	key: &[u8],
 ) -> Result<Option<D>, Error> {
@@ -162,9 +162,9 @@ fn query_inner<D: Decode>(
 			Ok(Some(res))
 		},
 		Ok(None) => Ok(None),
-		Err(e) => {
-			tracing::warn!(target: LOG_TARGET, err = ?e, "Error reading from the availability store");
-			Err(e.into())
+		Err(err) => {
+			gum::warn!(target: LOG_TARGET, ?err, "Error reading from the availability store");
+			Err(err.into())
 		},
 	}
 }
@@ -181,7 +181,7 @@ fn write_available_data(
 }
 
 fn load_available_data(
-	db: &Arc<dyn KeyValueDB>,
+	db: &Arc<dyn Database>,
 	config: &Config,
 	hash: &CandidateHash,
 ) -> Result<Option<AvailableData>, Error> {
@@ -197,7 +197,7 @@ fn delete_available_data(tx: &mut DBTransaction, config: &Config, hash: &Candida
 }
 
 fn load_chunk(
-	db: &Arc<dyn KeyValueDB>,
+	db: &Arc<dyn Database>,
 	config: &Config,
 	candidate_hash: &CandidateHash,
 	chunk_index: ValidatorIndex,
@@ -231,7 +231,7 @@ fn delete_chunk(
 }
 
 fn load_meta(
-	db: &Arc<dyn KeyValueDB>,
+	db: &Arc<dyn Database>,
 	config: &Config,
 	hash: &CandidateHash,
 ) -> Result<Option<CandidateMeta>, Error> {
@@ -355,6 +355,9 @@ pub enum Error {
 	#[error(transparent)]
 	Subsystem(#[from] SubsystemError),
 
+	#[error("Context signal channel closed")]
+	ContextChannelClosed,
+
 	#[error(transparent)]
 	Time(#[from] SystemTimeError),
 
@@ -366,13 +369,29 @@ pub enum Error {
 }
 
 impl Error {
+	/// Determine if the error is irrecoverable
+	/// or notifying the user via means of logging
+	/// is sufficient.
+	fn is_fatal(&self) -> bool {
+		match self {
+			Self::Io(_) => true,
+			Self::Oneshot(_) => true,
+			Self::CustomDatabase => true,
+			Self::ContextChannelClosed => true,
+			_ => false,
+		}
+	}
+}
+
+impl Error {
 	fn trace(&self) {
 		match self {
 			// don't spam the log with spurious errors
-			Self::RuntimeApi(_) | Self::Oneshot(_) =>
-				tracing::debug!(target: LOG_TARGET, err = ?self),
+			Self::RuntimeApi(_) | Self::Oneshot(_) => {
+				gum::debug!(target: LOG_TARGET, err = ?self)
+			},
 			// it's worth reporting otherwise
-			_ => tracing::warn!(target: LOG_TARGET, err = ?self),
+			_ => gum::warn!(target: LOG_TARGET, err = ?self),
 		}
 	}
 }
@@ -428,7 +447,7 @@ impl Clock for SystemClock {
 pub struct AvailabilityStoreSubsystem {
 	pruning_config: PruningConfig,
 	config: Config,
-	db: Arc<dyn KeyValueDB>,
+	db: Arc<dyn Database>,
 	known_blocks: KnownUnfinalizedBlocks,
 	finalized_number: Option<BlockNumber>,
 	metrics: Metrics,
@@ -437,7 +456,7 @@ pub struct AvailabilityStoreSubsystem {
 
 impl AvailabilityStoreSubsystem {
 	/// Create a new `AvailabilityStoreSubsystem` with a given config on disk.
-	pub fn new(db: Arc<dyn KeyValueDB>, config: Config, metrics: Metrics) -> Self {
+	pub fn new(db: Arc<dyn Database>, config: Config, metrics: Metrics) -> Self {
 		Self::with_pruning_config_and_clock(
 			db,
 			config,
@@ -449,7 +468,7 @@ impl AvailabilityStoreSubsystem {
 
 	/// Create a new `AvailabilityStoreSubsystem` with a given config on disk.
 	fn with_pruning_config_and_clock(
-		db: Arc<dyn KeyValueDB>,
+		db: Arc<dyn Database>,
 		config: Config,
 		pruning_config: PruningConfig,
 		clock: Box<dyn Clock>,
@@ -524,13 +543,12 @@ where
 		match res {
 			Err(e) => {
 				e.trace();
-
-				if let Error::Subsystem(SubsystemError::Context(_)) = e {
+				if e.is_fatal() {
 					break
 				}
 			},
 			Ok(true) => {
-				tracing::info!(target: LOG_TARGET, "received `Conclude` signal, exiting");
+				gum::info!(target: LOG_TARGET, "received `Conclude` signal, exiting");
 				break
 			},
 			Ok(false) => continue,
@@ -549,7 +567,7 @@ where
 {
 	select! {
 		incoming = ctx.recv().fuse() => {
-			match incoming? {
+			match incoming.map_err(|_| Error::ContextChannelClosed)? {
 				FromOverseer::Signal(OverseerSignal::Conclude) => return Ok(true),
 				FromOverseer::Signal(OverseerSignal::ActiveLeaves(
 					ActiveLeavesUpdate { activated, .. })
@@ -647,7 +665,7 @@ where
 
 async fn process_new_head<Context>(
 	ctx: &mut Context,
-	db: &Arc<dyn KeyValueDB>,
+	db: &Arc<dyn Database>,
 	db_transaction: &mut DBTransaction,
 	config: &Config,
 	pruning_config: &PruningConfig,
@@ -697,7 +715,7 @@ where
 }
 
 fn note_block_backed(
-	db: &Arc<dyn KeyValueDB>,
+	db: &Arc<dyn Database>,
 	db_transaction: &mut DBTransaction,
 	config: &Config,
 	pruning_config: &PruningConfig,
@@ -707,13 +725,13 @@ fn note_block_backed(
 ) -> Result<(), Error> {
 	let candidate_hash = candidate.hash();
 
-	tracing::debug!(target: LOG_TARGET, ?candidate_hash, "Candidate backed");
+	gum::debug!(target: LOG_TARGET, ?candidate_hash, "Candidate backed");
 
 	if load_meta(db, config, &candidate_hash)?.is_none() {
 		let meta = CandidateMeta {
 			state: State::Unavailable(now.into()),
 			data_available: false,
-			chunks_stored: bitvec::bitvec![BitOrderLsb0, u8; 0; n_validators],
+			chunks_stored: bitvec::bitvec![u8, BitOrderLsb0; 0; n_validators],
 		};
 
 		let prune_at = now + pruning_config.keep_unavailable_for;
@@ -726,7 +744,7 @@ fn note_block_backed(
 }
 
 fn note_block_included(
-	db: &Arc<dyn KeyValueDB>,
+	db: &Arc<dyn Database>,
 	db_transaction: &mut DBTransaction,
 	config: &Config,
 	pruning_config: &PruningConfig,
@@ -739,7 +757,7 @@ fn note_block_included(
 		None => {
 			// This is alarming. We've observed a block being included without ever seeing it backed.
 			// Warn and ignore.
-			tracing::warn!(
+			gum::warn!(
 				target: LOG_TARGET,
 				?candidate_hash,
 				"Candidate included without being backed?",
@@ -748,7 +766,7 @@ fn note_block_included(
 		Some(mut meta) => {
 			let be_block = (BEBlockNumber(block.0), block.1);
 
-			tracing::debug!(target: LOG_TARGET, ?candidate_hash, "Candidate included");
+			gum::debug!(target: LOG_TARGET, ?candidate_hash, "Candidate included");
 
 			meta.state = match meta.state {
 				State::Unavailable(at) => {
@@ -840,9 +858,19 @@ where
 			let (tx, rx) = oneshot::channel();
 			ctx.send_message(ChainApiMessage::FinalizedBlockHash(batch_num, tx)).await;
 
-			match rx.await?? {
-				None => {
-					tracing::warn!(
+			match rx.await? {
+				Err(err) => {
+					gum::warn!(
+						target: LOG_TARGET,
+						batch_num,
+						?err,
+						"Failed to retrieve finalized block number.",
+					);
+
+					break
+				},
+				Ok(None) => {
+					gum::warn!(
 						target: LOG_TARGET,
 						"Availability store was informed that block #{} is finalized, \
 						but chain API has no finalized hash.",
@@ -851,7 +879,7 @@ where
 
 					break
 				},
-				Some(h) => h,
+				Ok(Some(h)) => h,
 			}
 		};
 
@@ -920,7 +948,7 @@ fn update_blocks_at_finalized_height(
 	for (candidate_hash, is_finalized) in candidates {
 		let mut meta = match load_meta(&subsystem.db, &subsystem.config, &candidate_hash)? {
 			None => {
-				tracing::warn!(
+				gum::warn!(
 					target: LOG_TARGET,
 					"Dangling candidate metadata for {}",
 					candidate_hash,
@@ -1037,7 +1065,7 @@ fn process_message(
 						)? {
 							Some(c) => chunks.push(c),
 							None => {
-								tracing::warn!(
+								gum::warn!(
 									target: LOG_TARGET,
 									?candidate,
 									index,
@@ -1074,19 +1102,18 @@ fn process_message(
 				},
 			}
 		},
-		AvailabilityStoreMessage::StoreAvailableData(
-			candidate,
-			_our_index,
+		AvailabilityStoreMessage::StoreAvailableData {
+			candidate_hash,
 			n_validators,
 			available_data,
 			tx,
-		) => {
+		} => {
 			subsystem.metrics.on_chunks_received(n_validators as _);
 
 			let _timer = subsystem.metrics.time_store_available_data();
 
 			let res =
-				store_available_data(&subsystem, candidate, n_validators as _, available_data);
+				store_available_data(&subsystem, candidate_hash, n_validators as _, available_data);
 
 			match res {
 				Ok(()) => {
@@ -1094,7 +1121,7 @@ fn process_message(
 				},
 				Err(e) => {
 					let _ = tx.send(Err(()));
-					return Err(e)
+					return Err(e.into())
 				},
 			}
 		},
@@ -1105,7 +1132,7 @@ fn process_message(
 
 // Ok(true) on success, Ok(false) on failure, and Err on internal error.
 fn store_chunk(
-	db: &Arc<dyn KeyValueDB>,
+	db: &Arc<dyn Database>,
 	config: &Config,
 	candidate_hash: CandidateHash,
 	chunk: ErasureChunk,
@@ -1128,7 +1155,7 @@ fn store_chunk(
 		None => return Ok(false), // out of bounds.
 	}
 
-	tracing::debug!(
+	gum::debug!(
 		target: LOG_TARGET,
 		?candidate_hash,
 		chunk_index = %chunk.index.0,
@@ -1187,19 +1214,19 @@ fn store_available_data(
 	}
 
 	meta.data_available = true;
-	meta.chunks_stored = bitvec::bitvec![BitOrderLsb0, u8; 1; n_validators];
+	meta.chunks_stored = bitvec::bitvec![u8, BitOrderLsb0; 1; n_validators];
 
 	write_meta(&mut tx, &subsystem.config, &candidate_hash, &meta);
 	write_available_data(&mut tx, &subsystem.config, &candidate_hash, &available_data);
 
 	subsystem.db.write(tx)?;
 
-	tracing::debug!(target: LOG_TARGET, ?candidate_hash, "Stored data and chunks");
+	gum::debug!(target: LOG_TARGET, ?candidate_hash, "Stored data and chunks");
 
 	Ok(())
 }
 
-fn prune_all(db: &Arc<dyn KeyValueDB>, config: &Config, clock: &dyn Clock) -> Result<(), Error> {
+fn prune_all(db: &Arc<dyn Database>, config: &Config, clock: &dyn Clock) -> Result<(), Error> {
 	let now = clock.now()?;
 	let (range_start, range_end) = pruning_range(now);
 
@@ -1250,132 +1277,4 @@ fn prune_all(db: &Arc<dyn KeyValueDB>, config: &Config, clock: &dyn Clock) -> Re
 
 	db.write(tx)?;
 	Ok(())
-}
-
-#[derive(Clone)]
-struct MetricsInner {
-	received_availability_chunks_total: prometheus::Counter<prometheus::U64>,
-	pruning: prometheus::Histogram,
-	process_block_finalized: prometheus::Histogram,
-	block_activated: prometheus::Histogram,
-	process_message: prometheus::Histogram,
-	store_available_data: prometheus::Histogram,
-	store_chunk: prometheus::Histogram,
-	get_chunk: prometheus::Histogram,
-}
-
-/// Availability metrics.
-#[derive(Default, Clone)]
-pub struct Metrics(Option<MetricsInner>);
-
-impl Metrics {
-	fn on_chunks_received(&self, count: usize) {
-		if let Some(metrics) = &self.0 {
-			use core::convert::TryFrom as _;
-			// assume usize fits into u64
-			let by = u64::try_from(count).unwrap_or_default();
-			metrics.received_availability_chunks_total.inc_by(by);
-		}
-	}
-
-	/// Provide a timer for `prune_povs` which observes on drop.
-	fn time_pruning(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
-		self.0.as_ref().map(|metrics| metrics.pruning.start_timer())
-	}
-
-	/// Provide a timer for `process_block_finalized` which observes on drop.
-	fn time_process_block_finalized(
-		&self,
-	) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
-		self.0.as_ref().map(|metrics| metrics.process_block_finalized.start_timer())
-	}
-
-	/// Provide a timer for `block_activated` which observes on drop.
-	fn time_block_activated(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
-		self.0.as_ref().map(|metrics| metrics.block_activated.start_timer())
-	}
-
-	/// Provide a timer for `process_message` which observes on drop.
-	fn time_process_message(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
-		self.0.as_ref().map(|metrics| metrics.process_message.start_timer())
-	}
-
-	/// Provide a timer for `store_available_data` which observes on drop.
-	fn time_store_available_data(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
-		self.0.as_ref().map(|metrics| metrics.store_available_data.start_timer())
-	}
-
-	/// Provide a timer for `store_chunk` which observes on drop.
-	fn time_store_chunk(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
-		self.0.as_ref().map(|metrics| metrics.store_chunk.start_timer())
-	}
-
-	/// Provide a timer for `get_chunk` which observes on drop.
-	fn time_get_chunk(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
-		self.0.as_ref().map(|metrics| metrics.get_chunk.start_timer())
-	}
-}
-
-impl metrics::Metrics for Metrics {
-	fn try_register(registry: &prometheus::Registry) -> Result<Self, prometheus::PrometheusError> {
-		let metrics = MetricsInner {
-			received_availability_chunks_total: prometheus::register(
-				prometheus::Counter::new(
-					"parachain_received_availability_chunks_total",
-					"Number of availability chunks received.",
-				)?,
-				registry,
-			)?,
-			pruning: prometheus::register(
-				prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
-					"parachain_av_store_pruning",
-					"Time spent within `av_store::prune_all`",
-				))?,
-				registry,
-			)?,
-			process_block_finalized: prometheus::register(
-				prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
-					"parachain_av_store_process_block_finalized",
-					"Time spent within `av_store::process_block_finalized`",
-				))?,
-				registry,
-			)?,
-			block_activated: prometheus::register(
-				prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
-					"parachain_av_store_block_activated",
-					"Time spent within `av_store::process_block_activated`",
-				))?,
-				registry,
-			)?,
-			process_message: prometheus::register(
-				prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
-					"parachain_av_store_process_message",
-					"Time spent within `av_store::process_message`",
-				))?,
-				registry,
-			)?,
-			store_available_data: prometheus::register(
-				prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
-					"parachain_av_store_store_available_data",
-					"Time spent within `av_store::store_available_data`",
-				))?,
-				registry,
-			)?,
-			store_chunk: prometheus::register(
-				prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
-					"parachain_av_store_store_chunk",
-					"Time spent within `av_store::store_chunk`",
-				))?,
-				registry,
-			)?,
-			get_chunk: prometheus::register(
-				prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
-					"parachain_av_store_get_chunk",
-					"Time spent fetching requested chunks.`",
-				))?,
-				registry,
-			)?,
-		};
-		Ok(Metrics(Some(metrics)))
-	}
 }

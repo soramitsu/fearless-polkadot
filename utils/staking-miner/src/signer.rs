@@ -16,11 +16,11 @@
 
 //! Wrappers around creating a signer account.
 
-use crate::{rpc_helpers, AccountId, Error, Index, Pair, WsClient, LOG_TARGET};
-use sp_core::crypto::Pair as _;
-use std::path::Path;
+use crate::{prelude::*, rpc::SharedRpcClient, AccountId, Error, Index, Pair, LOG_TARGET};
+use frame_system::AccountInfo;
+use sp_core::{crypto::Pair as _, storage::StorageKey};
 
-pub(crate) const SIGNER_ACCOUNT_WILL_EXIST: &'static str =
+pub(crate) const SIGNER_ACCOUNT_WILL_EXIST: &str =
 	"signer account is checked to exist upon startup; it can only die if it transfers funds out \
 	 of it, or get slashed. If it does not exist at this point, it is likely due to a bug, or the \
 	 signer got slashed. Terminating.";
@@ -30,45 +30,55 @@ pub(crate) const SIGNER_ACCOUNT_WILL_EXIST: &'static str =
 pub(crate) struct Signer {
 	/// The account id.
 	pub(crate) account: AccountId,
+
 	/// The full crypto key-pair.
 	pub(crate) pair: Pair,
-	/// The raw URI read from file.
-	pub(crate) uri: String,
 }
 
-pub(crate) async fn get_account_info<T: frame_system::Config>(
-	client: &WsClient,
+pub(crate) async fn get_account_info<T: frame_system::Config<Hash = Hash> + EPM::Config>(
+	rpc: &SharedRpcClient,
 	who: &T::AccountId,
 	maybe_at: Option<T::Hash>,
-) -> Result<Option<frame_system::AccountInfo<Index, T::AccountData>>, Error> {
-	rpc_helpers::get_storage::<frame_system::AccountInfo<Index, T::AccountData>>(
-		client,
-		crate::params! {
-			sp_core::storage::StorageKey(<frame_system::Account<T>>::hashed_key_for(&who)),
-			maybe_at
-		},
+) -> Result<Option<AccountInfo<Index, T::AccountData>>, Error<T>> {
+	rpc.get_storage_and_decode::<AccountInfo<Index, T::AccountData>>(
+		&StorageKey(<frame_system::Account<T>>::hashed_key_for(&who)),
+		maybe_at,
 	)
 	.await
+	.map_err(Into::into)
 }
 
-/// Read the signer account's URI from the given `path`.
-pub(crate) async fn read_signer_uri<
-	P: AsRef<Path>,
-	T: frame_system::Config<AccountId = AccountId, Index = Index>,
+/// Read the signer account's URI
+pub(crate) async fn signer_uri_from_string<
+	T: frame_system::Config<
+			AccountId = AccountId,
+			Index = Index,
+			AccountData = pallet_balances::AccountData<Balance>,
+			Hash = Hash,
+		> + EPM::Config,
 >(
-	path: P,
-	client: &WsClient,
-) -> Result<Signer, Error> {
-	let uri = std::fs::read_to_string(path)?;
+	mut seed_or_path: &str,
+	client: &SharedRpcClient,
+) -> Result<Signer, Error<T>> {
+	seed_or_path = seed_or_path.trim();
 
-	// trim any trailing garbage.
-	let uri = uri.trim_end();
+	let seed = match std::fs::read(seed_or_path) {
+		Ok(s) => String::from_utf8(s).map_err(|_| Error::<T>::AccountDoesNotExists)?,
+		Err(_) => seed_or_path.to_string(),
+	};
+	let seed = seed.trim();
 
-	let pair = Pair::from_string(&uri, None)?;
+	let pair = Pair::from_string(seed, None)?;
 	let account = T::AccountId::from(pair.public());
-	let _info = get_account_info::<T>(&client, &account, None)
+	let _info = get_account_info::<T>(client, &account, None)
 		.await?
-		.ok_or(Error::AccountDoesNotExists)?;
-	log::info!(target: LOG_TARGET, "loaded account {:?}, info: {:?}", &account, _info);
-	Ok(Signer { account, pair, uri: uri.to_string() })
+		.ok_or(Error::<T>::AccountDoesNotExists)?;
+	log::info!(
+		target: LOG_TARGET,
+		"loaded account {:?}, free: {:?}, info: {:?}",
+		&account,
+		Token::from(_info.data.free),
+		_info
+	);
+	Ok(Signer { account, pair })
 }

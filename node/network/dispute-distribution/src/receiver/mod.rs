@@ -21,19 +21,20 @@ use std::{
 };
 
 use futures::{
-	channel::{mpsc, oneshot},
+	channel::oneshot,
 	future::{poll_fn, BoxFuture},
+	pin_mut,
 	stream::{FusedStream, FuturesUnordered, StreamExt},
-	FutureExt, Stream,
+	Future, FutureExt, Stream,
 };
 use lru::LruCache;
 
 use polkadot_node_network_protocol::{
 	authority_discovery::AuthorityDiscovery,
 	request_response::{
-		request::{OutgoingResponse, OutgoingResponseSender},
+		incoming::{self, OutgoingResponse, OutgoingResponseSender},
 		v1::{DisputeRequest, DisputeResponse},
-		IncomingRequest,
+		IncomingRequest, IncomingRequestReceiver,
 	},
 	PeerId, UnifiedReputationChange as Rep,
 };
@@ -50,7 +51,7 @@ use crate::{
 };
 
 mod error;
-use self::error::{log_error, Fatal, FatalResult, NonFatal, NonFatalResult, Result};
+use self::error::{log_error, JfyiError, JfyiErrorResult, Result};
 
 const COST_INVALID_REQUEST: Rep = Rep::CostMajor("Received message could not be decoded.");
 const COST_INVALID_SIGNATURE: Rep = Rep::Malicious("Signatures were invalid.");
@@ -72,7 +73,7 @@ pub struct DisputesReceiver<Sender, AD> {
 	sender: Sender,
 
 	/// Channel to retrieve incoming requests from.
-	receiver: mpsc::Receiver<sc_network::config::IncomingRequest>,
+	receiver: IncomingRequestReceiver<DisputeRequest>,
 
 	/// Authority discovery service:
 	authority_discovery: AD,
@@ -100,29 +101,30 @@ enum MuxedMessage {
 	/// - We need to make sure responses are actually sent (therefore we need to await futures
 	/// promptly).
 	/// - We need to update `banned_peers` accordingly to the result.
-	ConfirmedImport(NonFatalResult<(PeerId, ImportStatementsResult)>),
+	ConfirmedImport(JfyiErrorResult<(PeerId, ImportStatementsResult)>),
 
 	/// A new request has arrived and should be handled.
-	NewRequest(sc_network::config::IncomingRequest),
+	NewRequest(IncomingRequest<DisputeRequest>),
 }
 
 impl MuxedMessage {
 	async fn receive(
 		pending_imports: &mut PendingImports,
-		pending_requests: &mut mpsc::Receiver<sc_network::config::IncomingRequest>,
-	) -> FatalResult<MuxedMessage> {
+		pending_requests: &mut IncomingRequestReceiver<DisputeRequest>,
+	) -> Result<MuxedMessage> {
 		poll_fn(|ctx| {
-			if let Poll::Ready(v) = pending_requests.poll_next_unpin(ctx) {
-				let r = match v {
-					None => Err(Fatal::RequestChannelFinished),
-					Some(msg) => Ok(MuxedMessage::NewRequest(msg)),
-				};
-				return Poll::Ready(r)
+			let next_req = pending_requests.recv(|| vec![COST_INVALID_REQUEST]);
+			pin_mut!(next_req);
+			if let Poll::Ready(r) = next_req.poll(ctx) {
+				return match r {
+					Err(e) => Poll::Ready(Err(incoming::Error::from(e).into())),
+					Ok(v) => Poll::Ready(Ok(Self::NewRequest(v))),
+				}
 			}
 			// In case of Ready(None) return `Pending` below - we want to wait for the next request
 			// in that case.
 			if let Poll::Ready(Some(v)) = pending_imports.poll_next_unpin(ctx) {
-				return Poll::Ready(Ok(MuxedMessage::ConfirmedImport(v)))
+				return Poll::Ready(Ok(Self::ConfirmedImport(v)))
 			}
 			Poll::Pending
 		})
@@ -137,13 +139,13 @@ where
 	/// Create a new receiver which can be `run`.
 	pub fn new(
 		sender: Sender,
-		receiver: mpsc::Receiver<sc_network::config::IncomingRequest>,
+		receiver: IncomingRequestReceiver<DisputeRequest>,
 		authority_discovery: AD,
 		metrics: Metrics,
 	) -> Self {
 		let runtime = RuntimeInfo::new_with_config(runtime::Config {
 			keystore: None,
-			session_cache_lru_size: DISPUTE_WINDOW as usize,
+			session_cache_lru_size: DISPUTE_WINDOW.get() as usize,
 		});
 		Self {
 			runtime,
@@ -165,15 +167,12 @@ where
 		loop {
 			match log_error(self.run_inner().await) {
 				Ok(()) => {},
-				Err(Fatal::RequestChannelFinished) => {
-					tracing::debug!(
+				Err(fatal) => {
+					gum::debug!(
 						target: LOG_TARGET,
-						"Incoming request stream exhausted - shutting down?"
+						error = ?fatal,
+						"Shutting down"
 					);
-					return
-				},
-				Err(err) => {
-					tracing::warn!(target: LOG_TARGET, ?err, "Dispute receiver died.");
 					return
 				},
 			}
@@ -184,7 +183,7 @@ where
 	async fn run_inner(&mut self) -> Result<()> {
 		let msg = MuxedMessage::receive(&mut self.pending_imports, &mut self.receiver).await?;
 
-		let raw = match msg {
+		let incoming = match msg {
 			// We need to clean up futures, to make sure responses are sent:
 			MuxedMessage::ConfirmedImport(m_bad) => {
 				self.ban_bad_peer(m_bad)?;
@@ -195,29 +194,25 @@ where
 
 		self.metrics.on_received_request();
 
-		let peer = raw.peer;
+		let peer = incoming.peer;
 
 		// Only accept messages from validators:
-		if self.authority_discovery.get_authority_id_by_peer_id(raw.peer).await.is_none() {
-			raw.pending_response
-				.send(sc_network::config::OutgoingResponse {
+		if self.authority_discovery.get_authority_ids_by_peer_id(peer).await.is_none() {
+			incoming
+				.send_outgoing_response(OutgoingResponse {
 					result: Err(()),
-					reputation_changes: vec![COST_NOT_A_VALIDATOR.into_base_rep()],
+					reputation_changes: vec![COST_NOT_A_VALIDATOR],
 					sent_feedback: None,
 				})
-				.map_err(|_| NonFatal::SendResponse(peer))?;
+				.map_err(|_| JfyiError::SendResponse(peer))?;
 
-			return Err(NonFatal::NotAValidator(peer).into())
+			return Err(JfyiError::NotAValidator(peer).into())
 		}
-
-		let incoming =
-			IncomingRequest::<DisputeRequest>::try_from_raw(raw, vec![COST_INVALID_REQUEST])
-				.map_err(NonFatal::FromRawRequest)?;
 
 		// Immediately drop requests from peers that already have requests in flight or have
 		// been banned recently (flood protection):
 		if self.pending_imports.peer_is_pending(&peer) || self.banned_peers.contains(&peer) {
-			tracing::trace!(
+			gum::trace!(
 				target: LOG_TARGET,
 				?peer,
 				"Dropping message from peer (banned/pending import)"
@@ -260,9 +255,9 @@ where
 						reputation_changes: vec![COST_INVALID_SIGNATURE],
 						sent_feedback: None,
 					})
-					.map_err(|_| NonFatal::SetPeerReputation(peer))?;
+					.map_err(|_| JfyiError::SetPeerReputation(peer))?;
 
-				return Err(From::from(NonFatal::InvalidSignature(peer)))
+				return Err(From::from(JfyiError::InvalidSignature(peer)))
 			},
 			Ok(votes) => votes,
 		};
@@ -276,7 +271,7 @@ where
 					candidate_receipt,
 					session: valid_vote.0.session_index(),
 					statements: vec![valid_vote, invalid_vote],
-					pending_confirmation,
+					pending_confirmation: Some(pending_confirmation),
 				},
 			))
 			.await;
@@ -290,8 +285,8 @@ where
 	/// In addition we report import metrics.
 	fn ban_bad_peer(
 		&mut self,
-		result: NonFatalResult<(PeerId, ImportStatementsResult)>,
-	) -> NonFatalResult<()> {
+		result: JfyiErrorResult<(PeerId, ImportStatementsResult)>,
+	) -> JfyiErrorResult<()> {
 		match result? {
 			(_, ImportStatementsResult::ValidImport) => {
 				self.metrics.on_imported(SUCCEEDED);
@@ -308,7 +303,8 @@ where
 /// Manage pending imports in a way that preserves invariants.
 struct PendingImports {
 	/// Futures in flight.
-	futures: FuturesUnordered<BoxFuture<'static, (PeerId, NonFatalResult<ImportStatementsResult>)>>,
+	futures:
+		FuturesUnordered<BoxFuture<'static, (PeerId, JfyiErrorResult<ImportStatementsResult>)>>,
 	/// Peers whose requests are currently in flight.
 	peers: HashSet<PeerId>,
 }
@@ -346,7 +342,7 @@ impl PendingImports {
 }
 
 impl Stream for PendingImports {
-	type Item = NonFatalResult<(PeerId, ImportStatementsResult)>;
+	type Item = JfyiErrorResult<(PeerId, ImportStatementsResult)>;
 	fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		match Pin::new(&mut self.futures).poll_next(ctx) {
 			Poll::Pending => Poll::Pending,
@@ -373,8 +369,8 @@ async fn respond_to_request(
 	peer: PeerId,
 	handled: oneshot::Receiver<ImportStatementsResult>,
 	pending_response: OutgoingResponseSender<DisputeRequest>,
-) -> NonFatalResult<ImportStatementsResult> {
-	let result = handled.await.map_err(|_| NonFatal::ImportCanceled(peer))?;
+) -> JfyiErrorResult<ImportStatementsResult> {
+	let result = handled.await.map_err(|_| JfyiError::ImportCanceled(peer))?;
 
 	let response = match result {
 		ImportStatementsResult::ValidImport => OutgoingResponse {
@@ -391,7 +387,7 @@ async fn respond_to_request(
 
 	pending_response
 		.send_outgoing_response(response)
-		.map_err(|_| NonFatal::SendResponse(peer))?;
+		.map_err(|_| JfyiError::SendResponse(peer))?;
 
 	Ok(result)
 }

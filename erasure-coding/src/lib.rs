@@ -25,12 +25,12 @@
 //! The data is coded so any f+1 chunks can be used to reconstruct the full data.
 
 use parity_scale_codec::{Decode, Encode};
-use polkadot_node_primitives::AvailableData;
-use polkadot_primitives::v0::{self, BlakeTwo256, Hash as H256, HashT};
+use polkadot_node_primitives::{AvailableData, Proof};
+use polkadot_primitives::v2::{BlakeTwo256, Hash as H256, HashT};
 use sp_core::Blake2Hasher;
 use thiserror::Error;
 use trie::{
-	trie_types::{TrieDB, TrieDBMut},
+	trie_types::{TrieDB, TrieDBMutV0 as TrieDBMut},
 	MemoryDB, Trie, TrieMut, EMPTY_PREFIX,
 };
 
@@ -113,16 +113,6 @@ fn code_params(n_validators: usize) -> Result<CodeParams, Error> {
 	})
 }
 
-/// Obtain erasure-coded chunks for v0 `AvailableData`, one for each validator.
-///
-/// Works only up to 65536 validators, and `n_validators` must be non-zero.
-pub fn obtain_chunks_v0(
-	n_validators: usize,
-	data: &v0::AvailableData,
-) -> Result<Vec<Vec<u8>>, Error> {
-	obtain_chunks(n_validators, data)
-}
-
 /// Obtain erasure-coded chunks for v1 `AvailableData`, one for each validator.
 ///
 /// Works only up to 65536 validators, and `n_validators` must be non-zero.
@@ -133,7 +123,7 @@ pub fn obtain_chunks_v1(n_validators: usize, data: &AvailableData) -> Result<Vec
 /// Obtain erasure-coded chunks, one for each validator.
 ///
 /// Works only up to 65536 validators, and `n_validators` must be non-zero.
-fn obtain_chunks<T: Encode>(n_validators: usize, data: &T) -> Result<Vec<Vec<u8>>, Error> {
+pub fn obtain_chunks<T: Encode>(n_validators: usize, data: &T) -> Result<Vec<Vec<u8>>, Error> {
 	let params = code_params(n_validators)?;
 	let encoded = data.encode();
 
@@ -147,20 +137,6 @@ fn obtain_chunks<T: Encode>(n_validators: usize, data: &T) -> Result<Vec<Vec<u8>
 		.expect("Payload non-empty, shard sizes are uniform, and validator numbers checked; qed");
 
 	Ok(shards.into_iter().map(|w: WrappedShard| w.into_inner()).collect())
-}
-
-/// Reconstruct the v0 available data from a set of chunks.
-///
-/// Provide an iterator containing chunk data and the corresponding index.
-/// The indices of the present chunks must be indicated. If too few chunks
-/// are provided, recovery is not possible.
-///
-/// Works only up to 65536 validators, and `n_validators` must be non-zero.
-pub fn reconstruct_v0<'a, I: 'a>(n_validators: usize, chunks: I) -> Result<v0::AvailableData, Error>
-where
-	I: IntoIterator<Item = (&'a [u8], usize)>,
-{
-	reconstruct(n_validators, chunks)
 }
 
 /// Reconstruct the v1 available data from a set of chunks.
@@ -184,7 +160,7 @@ where
 /// are provided, recovery is not possible.
 ///
 /// Works only up to 65536 validators, and `n_validators` must be non-zero.
-fn reconstruct<'a, I: 'a, T: Decode>(n_validators: usize, chunks: I) -> Result<T, Error>
+pub fn reconstruct<'a, I: 'a, T: Decode>(n_validators: usize, chunks: I) -> Result<T, Error>
 where
 	I: IntoIterator<Item = (&'a [u8], usize)>,
 {
@@ -245,7 +221,7 @@ impl<'a, I: AsRef<[u8]>> Branches<'a, I> {
 }
 
 impl<'a, I: AsRef<[u8]>> Iterator for Branches<'a, I> {
-	type Item = (Vec<Vec<u8>>, &'a [u8]);
+	type Item = (Proof, &'a [u8]);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		use trie::Recorder;
@@ -258,13 +234,12 @@ impl<'a, I: AsRef<[u8]>> Iterator for Branches<'a, I> {
 
 		match res.expect("all nodes in trie present; qed") {
 			Some(_) => {
-				let nodes = recorder.drain().into_iter().map(|r| r.data).collect();
+				let nodes: Vec<Vec<u8>> = recorder.drain().into_iter().map(|r| r.data).collect();
 				let chunk = self.chunks.get(self.current_pos).expect(
 					"there is a one-to-one mapping of chunks to valid merkle branches; qed",
 				);
-
 				self.current_pos += 1;
-				Some((nodes, chunk.as_ref()))
+				Proof::try_from(nodes).ok().map(|proof| (proof, chunk.as_ref()))
 			},
 			None => None,
 		}
@@ -297,10 +272,10 @@ where
 
 /// Verify a merkle branch, yielding the chunk hash meant to be present at that
 /// index.
-pub fn branch_hash(root: &H256, branch_nodes: &[Vec<u8>], index: usize) -> Result<H256, Error> {
+pub fn branch_hash(root: &H256, branch_nodes: &Proof, index: usize) -> Result<H256, Error> {
 	let mut trie_storage: MemoryDB<Blake2Hasher> = MemoryDB::default();
 	for node in branch_nodes.iter() {
-		(&mut trie_storage as &mut trie::HashDB<_>).insert(EMPTY_PREFIX, node.as_slice());
+		(&mut trie_storage as &mut trie::HashDB<_>).insert(EMPTY_PREFIX, node);
 	}
 
 	let trie = TrieDB::new(&trie_storage, &root).map_err(|_| Error::InvalidBranchProof)?;
@@ -369,7 +344,11 @@ impl<'a, I: Iterator<Item = &'a [u8]>> parity_scale_codec::Input for ShardInput<
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use polkadot_primitives::v0::{AvailableData, BlockData, PoVBlock};
+	use polkadot_node_primitives::{AvailableData, BlockData, PoV};
+
+	// In order to adequately compute the number of entries in the Merkle
+	// trie, we must account for the fixed 16-ary trie structure.
+	const KEY_INDEX_NIBBLE_SIZE: usize = 4;
 
 	#[test]
 	fn field_order_is_right_size() {
@@ -378,9 +357,9 @@ mod tests {
 
 	#[test]
 	fn round_trip_works() {
-		let pov_block = PoVBlock { block_data: BlockData((0..255).collect()) };
+		let pov = PoV { block_data: BlockData((0..255).collect()) };
 
-		let available_data = AvailableData { pov_block, omitted_validation: Default::default() };
+		let available_data = AvailableData { pov: pov.into(), validation_data: Default::default() };
 		let chunks = obtain_chunks(10, &available_data).unwrap();
 
 		assert_eq!(chunks.len(), 10);
@@ -403,25 +382,35 @@ mod tests {
 		assert_eq!(reconstructed, Err(Error::NotEnoughValidators));
 	}
 
-	#[test]
-	fn construct_valid_branches() {
-		let pov_block = PoVBlock { block_data: BlockData(vec![2; 256]) };
+	fn generate_trie_and_generate_proofs(magnitude: u32) {
+		let n_validators = 2_u32.pow(magnitude) as usize;
+		let pov = PoV { block_data: BlockData(vec![2; n_validators / KEY_INDEX_NIBBLE_SIZE]) };
 
-		let available_data = AvailableData { pov_block, omitted_validation: Default::default() };
+		let available_data = AvailableData { pov: pov.into(), validation_data: Default::default() };
 
-		let chunks = obtain_chunks(10, &available_data).unwrap();
+		let chunks = obtain_chunks(magnitude as usize, &available_data).unwrap();
 
-		assert_eq!(chunks.len(), 10);
+		assert_eq!(chunks.len() as u32, magnitude);
 
 		let branches = branches(chunks.as_ref());
 		let root = branches.root();
 
 		let proofs: Vec<_> = branches.map(|(proof, _)| proof).collect();
-
-		assert_eq!(proofs.len(), 10);
-
+		assert_eq!(proofs.len() as u32, magnitude);
 		for (i, proof) in proofs.into_iter().enumerate() {
+			let encode = Encode::encode(&proof);
+			let decode = Decode::decode(&mut &encode[..]).unwrap();
+			assert_eq!(proof, decode);
+			assert_eq!(encode, Encode::encode(&decode));
+
 			assert_eq!(branch_hash(&root, &proof, i).unwrap(), BlakeTwo256::hash(&chunks[i]));
+		}
+	}
+
+	#[test]
+	fn roundtrip_proof_encoding() {
+		for i in 2..16 {
+			generate_trie_and_generate_proofs(i);
 		}
 	}
 }
