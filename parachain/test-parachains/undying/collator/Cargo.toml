@@ -1,26 +1,26 @@
 [package]
-name = "test-parachain-adder-collator"
+name = "test-parachain-undying-collator"
 version = "0.9.19"
 authors = ["Parity Technologies <admin@parity.io>"]
-description = "Collator for the adder test parachain"
+description = "Collator for the undying test parachain"
 edition = "2021"
 
 [[bin]]
-name = "adder-collator"
+name = "undying-collator"
 path = "src/main.rs"
 
 [[bin]]
-name = "adder_collator_puppet_worker"
+name = "undying_collator_puppet_worker"
 path = "bin/puppet_worker.rs"
 
 [dependencies]
 parity-scale-codec = { version = "3.1.2", default-features = false, features = ["derive"] }
 clap = { version = "3.1", features = ["derive"] }
-futures = "0.3.21"
+futures = "0.3.19"
 futures-timer = "3.0.2"
 log = "0.4.17"
 
-test-parachain-adder = { path = ".." }
+test-parachain-undying = { path = ".." }
 polkadot-primitives = { path = "../../../../primitives" }
 polkadot-cli = { path = "../../../../cli" }
 polkadot-service = { path = "../../../../node/service", features = ["rococo-native"] }
@@ -44,4 +44,4 @@ substrate-test-utils = { git = "https://github.com/paritytech/substrate", branch
 sc-service = { git = "https://github.com/paritytech/substrate", branch = "master" }
 sp-keyring = { git = "https://github.com/paritytech/substrate", branch = "master" }
 
-tokio = { version = "1.17.0", features = ["macros"] }
+tokio = { version = "1.15", features = ["macros"] }

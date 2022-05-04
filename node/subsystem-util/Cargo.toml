@@ -1,43 +1,48 @@
 [package]
 name = "polkadot-node-subsystem-util"
-version = "0.9.9"
+version = "0.9.19"
 authors = ["Parity Technologies <admin@parity.io>"]
-edition = "2018"
+edition = "2021"
 description = "Subsystem traits and message definitions"
 
 [dependencies]
-async-trait = "0.1.42"
-futures = "0.3.15"
-futures-timer = "3.0.2"
+async-trait = "0.1.53"
+futures = "0.3.21"
 itertools = "0.10"
-parity-scale-codec = { version = "2.0.0", default-features = false, features = ["derive"] }
-parking_lot = { version = "0.11.1", optional = true }
-pin-project = "1.0.7"
-rand = "0.8.3"
-thiserror = "1.0.26"
-tracing = "0.1.26"
-lru = "0.6.6"
+parity-scale-codec = { version = "3.1.2", default-features = false, features = ["derive"] }
+parking_lot = "0.11.2"
+pin-project = "1.0.9"
+rand = "0.8.5"
+thiserror = "1.0.31"
+fatality = "0.0.6"
+gum = { package = "tracing-gum", path = "../gum" }
+derive_more = "0.99.17"
+lru = "0.7.5"
 
-polkadot-node-primitives = { path = "../primitives" }
 polkadot-node-subsystem = { package = "polkadot-node-subsystem", path = "../subsystem" }
 polkadot-node-jaeger = { path = "../jaeger" }
 polkadot-node-metrics = { path = "../metrics" }
 polkadot-node-network-protocol = { path = "../network/protocol" }
 polkadot-primitives = { path = "../../primitives" }
+polkadot-node-primitives = { path = "../primitives" }
 polkadot-overseer = { path = "../overseer" }
-metered-channel = { path = "../metered-channel"}
+metered-channel = { path = "../metered-channel" }
 
-sc-network = { git = "https://github.com/paritytech/substrate", branch = "master" }
 sp-core = { git = "https://github.com/paritytech/substrate", branch = "master" }
 sp-application-crypto = { git = "https://github.com/paritytech/substrate", branch = "master" }
 sp-keystore = { git = "https://github.com/paritytech/substrate", branch = "master" }
-substrate-prometheus-endpoint = { git = "https://github.com/paritytech/substrate", branch = "master" }
+
+kvdb = "0.11.0"
+parity-util-mem = { version = "0.11", default-features = false }
+parity-db = { version = "0.3.12" }
 
 [dev-dependencies]
 assert_matches = "1.4.0"
-async-trait = "0.1.42"
-env_logger = "0.8.4"
-futures = { version = "0.3.15", features = ["thread-pool"] }
-log = "0.4.13"
-parking_lot = "0.11.1"
+env_logger = "0.9.0"
+futures = { version = "0.3.21", features = ["thread-pool"] }
+log = "0.4.17"
 polkadot-node-subsystem-test-helpers = { path = "../subsystem-test-helpers" }
+lazy_static = "1.4.0"
+polkadot-primitives-test-helpers = { path = "../../primitives/test-helpers" }
+kvdb-shared-tests = "0.9.0"
+tempfile = "3.1.0"
