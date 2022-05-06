@@ -7,7 +7,7 @@ String imageName              = 'docker.soramitsu.co.jp/sora2/polkadot-fearless'
 
 properties([
     parameters([
-        string(defaultValue: 'abb447c7', name: 'polkadotCommit', trim: true, description: 'It MUST be short version hash')
+        string(defaultValue: '90f5c02', name: 'polkadotCommit', trim: true, description: 'It MUST be short version hash')
     ])
 ])
 
@@ -27,10 +27,10 @@ pipeline {
             steps{
                 script {
                     gitNotify('polkadot-CI', 'PENDING', 'This commit is being built')
-                    if ( polkadotCommit.length() != 8 ) {
+                    if ( polkadotCommit.length() != 7 ) {
                         error('You MUST use short version hash of commit!')
                     }
-                    sh "docker build --build-arg POLKADOT_COMMIT=${polkadotCommit} -f housekeeping/docker/Dockerfile -t ${imageName}:${polkadotCommit} ."
+                    sh "docker build --build-arg POLKADOT_COMMIT=${polkadotCommit} -f scripts/ci/dockerfiles/polkadot/polkadot_builder.Dockerfile -t ${imageName}:${polkadotCommit} ."
                 }
             }
         }
