@@ -7,7 +7,7 @@ String imageName              = 'docker.soramitsu.co.jp/sora2/polkadot-fearless'
 
 properties([
     parameters([
-        string(defaultValue: '8e5edc5', name: 'polkadotCommit', trim: true, description: 'It MUST be short version hash')
+        string(defaultValue: 'feda2be', name: 'polkadotCommit', trim: true, description: 'It MUST be short version hash')
     ])
 ])
 
