@@ -3,13 +3,7 @@
 String agentLabel             = 'docker-build-agent'
 String registry               = 'docker.soramitsu.co.jp'
 String dockerRegistryRWUserId = 'bot-sora2-rw'
-String imageName              = 'docker.soramitsu.co.jp/sora2/polkadot-fearless'
-
-properties([
-    parameters([
-        string(defaultValue: '5447a46', name: 'polkadotCommit', trim: true, description: 'It MUST be short version hash')
-    ])
-])
+String imageName              = 'docker.soramitsu.co.jp/sora2/polkadot-fearless:latest'
 
 pipeline {
     options {
@@ -26,11 +20,7 @@ pipeline {
         stage('Build image') {
             steps{
                 script {
-                    gitNotify('polkadot-CI', 'PENDING', 'This commit is being built')
-                    if ( polkadotCommit.length() != 7 ) {
-                        error('You MUST use short version hash of commit!')
-                    }
-                    sh "docker build --build-arg POLKADOT_COMMIT=${polkadotCommit} -f scripts/ci/dockerfiles/polkadot/polkadot_builder.Dockerfile -t ${imageName}:${polkadotCommit} ."
+                    sh "docker build -f scripts/ci/dockerfiles/polkadot/polkadot_builder.Dockerfile -t ${imageName} ."
                 }
             }
         }
@@ -39,9 +29,7 @@ pipeline {
                 script {
                     docker.withRegistry( 'https://' + registry, dockerRegistryRWUserId) {
                         sh """
-                            docker push ${imageName}:${polkadotCommit}
-                            docker tag ${imageName}:${polkadotCommit} ${imageName}:latest
-                            docker push ${imageName}:latest
+                            docker push ${imageName}
                         """
                     }
                 }
