@@ -19,7 +19,7 @@ LABEL description="Multistage Docker image for Polkadot: a platform for web3" \
 
 COPY --from=builder /polkadot/target/release/polkadot /usr/local/bin
 
-RUN useradd -m -u 1000 -U -s /bin/sh -d /polkadot polkadot && \
+RUN useradd -m -u 10000 -U -s /bin/sh -d /polkadot polkadot && \
 	mkdir -p /data /polkadot/.local/share && \
 	chown -R polkadot:polkadot /data && \
 	ln -s /data /polkadot/.local/share/polkadot && \
