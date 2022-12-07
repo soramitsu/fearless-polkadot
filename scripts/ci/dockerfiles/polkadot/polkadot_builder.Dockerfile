@@ -1,5 +1,11 @@
 # This is the build stage for Polkadot. Here we create the binary in a temporary image.
 FROM docker.io/paritytech/ci-linux:production as builder
+# Install dependencies
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y \
+    ca-certificates \
+    curl && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /polkadot
 COPY . /polkadot
