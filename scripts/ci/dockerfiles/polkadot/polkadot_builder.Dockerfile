@@ -1,11 +1,5 @@
 # This is the build stage for Polkadot. Here we create the binary in a temporary image.
 FROM docker.io/paritytech/ci-linux:production as builder
-# Install dependencies
-RUN apt-get update && \
-    apt-get install --no-install-recommends -y \
-    ca-certificates \
-    curl && \
-    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /polkadot
 COPY . /polkadot
@@ -22,6 +16,12 @@ LABEL description="Multistage Docker image for Polkadot: a platform for web3" \
 	io.parity.image.description="Polkadot: a platform for web3" \
 	io.parity.image.source="https://github.com/paritytech/polkadot/blob/${VCS_REF}/scripts/ci/dockerfiles/polkadot/polkadot_builder.Dockerfile" \
 	io.parity.image.documentation="https://github.com/paritytech/polkadot/"
+# Install dependencies
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y \
+    ca-certificates \
+    curl && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /polkadot/target/release/polkadot /usr/local/bin
 
