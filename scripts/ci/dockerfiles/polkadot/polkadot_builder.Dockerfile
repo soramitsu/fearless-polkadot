@@ -29,8 +29,6 @@ RUN useradd -m -u 10000 -U -s /bin/sh -d /polkadot polkadot && \
 	mkdir -p /data /polkadot/.local/share && \
 	chown -R polkadot:polkadot /data && \
 	ln -s /data /polkadot/.local/share/polkadot && \
-# unclutter and minimize the attack surface
-	rm -rf /usr/bin /usr/sbin && \
 # check if executable works in this container
 	/usr/local/bin/polkadot --version
 
