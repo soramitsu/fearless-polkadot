@@ -1,4 +1,4 @@
-// Copyright 2021 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -50,7 +50,7 @@ use frame_election_provider_support::NposSolver;
 use frame_support::traits::Get;
 use futures_util::StreamExt;
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
-use remote_externalities::{Builder, Mode, OnlineConfig};
+use remote_externalities::{Builder, Mode, OnlineConfig, Transport};
 use rpc::{RpcApiClient, SharedRpcClient};
 use runtime_versions::RuntimeVersions;
 use signal_hook::consts::signal::*;
@@ -302,7 +302,7 @@ async fn create_election_ext<T, B>(
 ) -> Result<Ext, Error<T>>
 where
 	T: EPM::Config,
-	B: BlockT,
+	B: BlockT + DeserializeOwned,
 	B::Header: DeserializeOwned,
 {
 	use frame_support::{storage::generator::StorageMap, traits::PalletInfo};
@@ -314,16 +314,17 @@ where
 	pallets.extend(additional);
 	Builder::<B>::new()
 		.mode(Mode::Online(OnlineConfig {
-			transport: client.into_inner().into(),
+			transport: Transport::Uri(client.uri().to_owned()),
 			at,
 			pallets,
+			hashed_prefixes: vec![<frame_system::BlockHash<T>>::prefix_hash()],
+			hashed_keys: vec![[twox_128(b"System"), twox_128(b"Number")].concat()],
 			..Default::default()
 		}))
-		.inject_hashed_prefix(&<frame_system::BlockHash<T>>::prefix_hash())
-		.inject_hashed_key(&[twox_128(b"System"), twox_128(b"Number")].concat())
 		.build()
 		.await
 		.map_err(|why| Error::RemoteExternalities(why))
+		.map(|rx| rx.inner_ext)
 }
 
 /// Compute the election. It expects to NOT be `Phase::Off`. In other words, the snapshot must

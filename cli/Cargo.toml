@@ -22,11 +22,13 @@ pyro = { package = "pyroscope", version = "0.3.1", optional = true }
 
 service = { package = "polkadot-service", path = "../node/service", default-features = false, optional = true }
 polkadot-client = { path = "../node/client", optional = true }
-polkadot-node-core-pvf = { path = "../node/core/pvf", optional = true }
+polkadot-node-core-pvf-worker = { path = "../node/core/pvf/worker", optional = true }
 polkadot-performance-test = { path = "../node/test/performance-test", optional = true }
 
 sp-core = { git = "https://github.com/paritytech/substrate", branch = "master" }
+sp-io = { git = "https://github.com/paritytech/substrate", branch = "master" }
 sp-keyring = { git = "https://github.com/paritytech/substrate", branch = "master" }
+sp-maybe-compressed-blob = { git = "https://github.com/paritytech/substrate", branch = "master" }
 frame-benchmarking-cli = { git = "https://github.com/paritytech/substrate", branch = "master", optional = true }
 try-runtime-cli = { git = "https://github.com/paritytech/substrate", branch = "master", optional = true }
 sc-cli = { git = "https://github.com/paritytech/substrate", branch = "master", optional = true }
@@ -34,12 +36,14 @@ sc-service = { git = "https://github.com/paritytech/substrate", branch = "master
 polkadot-node-metrics = { path = "../node/metrics" }
 sc-tracing = { git = "https://github.com/paritytech/substrate", branch = "master", optional = true }
 sc-sysinfo = { git = "https://github.com/paritytech/substrate", branch = "master" }
+sc-executor = { git = "https://github.com/paritytech/substrate", branch = "master" }
+sc-storage-monitor = { git = "https://github.com/paritytech/substrate", branch = "master" }
 
 [build-dependencies]
 substrate-build-script-utils = { git = "https://github.com/paritytech/substrate", branch = "master" }
 
 [features]
-default = ["db", "cli", "hostperfcheck", "full-node", "polkadot-native"]
+default = ["db", "cli", "full-node", "polkadot-native"]
 db = ["service/db"]
 cli = [
 	"clap",
@@ -49,7 +53,7 @@ cli = [
 	"frame-benchmarking-cli",
 	"try-runtime-cli",
 	"polkadot-client",
-	"polkadot-node-core-pvf",
+	"polkadot-node-core-pvf-worker",
 ]
 runtime-benchmarks = [
 	"service/runtime-benchmarks",

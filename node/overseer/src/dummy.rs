@@ -1,4 +1,4 @@
-// Copyright 2020 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -22,6 +22,9 @@ use crate::{
 use lru::LruCache;
 use orchestra::{FromOrchestra, SpawnedSubsystem, Subsystem, SubsystemContext};
 use polkadot_node_subsystem_types::{errors::SubsystemError, messages::*};
+// Generated dummy messages
+use crate::messages::*;
+
 /// A dummy subsystem that implements [`Subsystem`] for all
 /// types of messages. Used for tests or as a placeholder.
 #[derive(Clone, Copy, Debug)]
@@ -187,7 +190,6 @@ where
 		.span_per_active_leaf(Default::default())
 		.active_leaves(Default::default())
 		.known_leaves(LruCache::new(KNOWN_LEAVES_CACHE_SIZE))
-		.leaves(Default::default())
 		.spawner(SpawnGlue(spawner))
 		.metrics(metrics)
 		.supports_parachains(supports_parachains);

@@ -1,4 +1,4 @@
-// Copyright 2017-2020 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -24,7 +24,7 @@ use frame_support::{
 	traits::{Currency, Get, ReservableCurrency},
 };
 use frame_system::{self, ensure_root, ensure_signed};
-use primitives::v2::{HeadData, Id as ParaId, ValidationCode, LOWEST_PUBLIC_ID};
+use primitives::{HeadData, Id as ParaId, ValidationCode, LOWEST_PUBLIC_ID};
 use runtime_parachains::{
 	configuration, ensure_parachain,
 	paras::{self, ParaGenesisArgs},
@@ -97,7 +97,6 @@ pub mod pallet {
 	use frame_system::pallet_prelude::*;
 
 	#[pallet::pallet]
-	#[pallet::generate_store(pub(super) trait Store)]
 	#[pallet::without_storage_info]
 	pub struct Pallet<T>(_);
 
@@ -228,6 +227,7 @@ pub mod pallet {
 		///
 		/// ## Events
 		/// The `Registered` event is emitted in case of success.
+		#[pallet::call_index(0)]
 		#[pallet::weight(<T as Config>::WeightInfo::register())]
 		pub fn register(
 			origin: OriginFor<T>,
@@ -246,6 +246,7 @@ pub mod pallet {
 		///
 		/// The deposit taken can be specified for this registration. Any `ParaId`
 		/// can be registered, including sub-1000 IDs which are System Parachains.
+		#[pallet::call_index(1)]
 		#[pallet::weight(<T as Config>::WeightInfo::force_register())]
 		pub fn force_register(
 			origin: OriginFor<T>,
@@ -262,6 +263,7 @@ pub mod pallet {
 		/// Deregister a Para Id, freeing all data and returning any deposit.
 		///
 		/// The caller must be Root, the `para` owner, or the `para` itself. The para must be a parathread.
+		#[pallet::call_index(2)]
 		#[pallet::weight(<T as Config>::WeightInfo::deregister())]
 		pub fn deregister(origin: OriginFor<T>, id: ParaId) -> DispatchResult {
 			Self::ensure_root_para_or_owner(origin, id)?;
@@ -279,6 +281,7 @@ pub mod pallet {
 		/// `ParaId` to be a long-term identifier of a notional "parachain". However, their
 		/// scheduling info (i.e. whether they're a parathread or parachain), auction information
 		/// and the auction deposit are switched.
+		#[pallet::call_index(3)]
 		#[pallet::weight(<T as Config>::WeightInfo::swap())]
 		pub fn swap(origin: OriginFor<T>, id: ParaId, other: ParaId) -> DispatchResult {
 			Self::ensure_root_para_or_owner(origin, id)?;
@@ -328,6 +331,7 @@ pub mod pallet {
 		/// previously locked para to deregister or swap a para without using governance.
 		///
 		/// Can only be called by the Root origin or the parachain.
+		#[pallet::call_index(4)]
 		#[pallet::weight(T::DbWeight::get().reads_writes(1, 1))]
 		pub fn remove_lock(origin: OriginFor<T>, para: ParaId) -> DispatchResult {
 			Self::ensure_root_or_para(origin, para)?;
@@ -349,6 +353,7 @@ pub mod pallet {
 		///
 		/// ## Events
 		/// The `Reserved` event is emitted in case of success, which provides the ID reserved for use.
+		#[pallet::call_index(5)]
 		#[pallet::weight(<T as Config>::WeightInfo::reserve())]
 		pub fn reserve(origin: OriginFor<T>) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -362,6 +367,7 @@ pub mod pallet {
 		/// para to deregister or swap a para.
 		///
 		/// Can be called by Root, the parachain, or the parachain manager if the parachain is unlocked.
+		#[pallet::call_index(6)]
 		#[pallet::weight(T::DbWeight::get().reads_writes(1, 1))]
 		pub fn add_lock(origin: OriginFor<T>, para: ParaId) -> DispatchResult {
 			Self::ensure_root_para_or_owner(origin, para)?;
@@ -372,6 +378,7 @@ pub mod pallet {
 		/// Schedule a parachain upgrade.
 		///
 		/// Can be called by Root, the parachain, or the parachain manager if the parachain is unlocked.
+		#[pallet::call_index(7)]
 		#[pallet::weight(<T as Config>::WeightInfo::schedule_code_upgrade(new_code.0.len() as u32))]
 		pub fn schedule_code_upgrade(
 			origin: OriginFor<T>,
@@ -386,6 +393,7 @@ pub mod pallet {
 		/// Set the parachain's current head.
 		///
 		/// Can be called by Root, the parachain, or the parachain manager if the parachain is unlocked.
+		#[pallet::call_index(8)]
 		#[pallet::weight(<T as Config>::WeightInfo::set_current_head(new_head.0.len() as u32))]
 		pub fn set_current_head(
 			origin: OriginFor<T>,
@@ -650,11 +658,11 @@ mod tests {
 		assert_noop, assert_ok,
 		error::BadOrigin,
 		parameter_types,
-		traits::{GenesisBuild, OnFinalize, OnInitialize},
+		traits::{ConstU32, GenesisBuild, OnFinalize, OnInitialize},
 	};
 	use frame_system::limits;
 	use pallet_balances::Error as BalancesError;
-	use primitives::v2::{Balance, BlockNumber, Header};
+	use primitives::{Balance, BlockNumber, Header};
 	use runtime_parachains::{configuration, origin, shared};
 	use sp_core::H256;
 	use sp_io::TestExternalities;
@@ -696,9 +704,7 @@ mod tests {
 	parameter_types! {
 		pub const BlockHashCount: u32 = 250;
 		pub BlockWeights: limits::BlockWeights =
-			frame_system::limits::BlockWeights::simple_max(
-				Weight::from_ref_time(1024).set_proof_size(u64::MAX),
-			);
+			frame_system::limits::BlockWeights::simple_max(Weight::from_parts(1024, u64::MAX));
 		pub BlockLength: limits::BlockLength =
 			limits::BlockLength::max_with_normal_ratio(4 * 1024 * 1024, NORMAL_RATIO);
 	}
@@ -744,6 +750,10 @@ mod tests {
 		type MaxReserves = ();
 		type ReserveIdentifier = [u8; 8];
 		type WeightInfo = ();
+		type HoldIdentifier = ();
+		type FreezeIdentifier = ();
+		type MaxHolds = ConstU32<1>;
+		type MaxFreezes = ConstU32<1>;
 	}
 
 	impl shared::Config for Test {}
@@ -1280,7 +1290,7 @@ mod benchmarking {
 	use crate::traits::Registrar as RegistrarT;
 	use frame_support::assert_ok;
 	use frame_system::RawOrigin;
-	use primitives::v2::{MAX_CODE_SIZE, MAX_HEAD_DATA_SIZE};
+	use primitives::{MAX_CODE_SIZE, MAX_HEAD_DATA_SIZE};
 	use runtime_parachains::{paras, shared, Origin as ParaOrigin};
 	use sp_runtime::traits::Bounded;
 

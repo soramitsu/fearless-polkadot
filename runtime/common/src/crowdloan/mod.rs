@@ -1,4 +1,4 @@
-// Copyright 2017-2020 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -51,8 +51,6 @@
 
 pub mod migration;
 
-// TODO: Expose the total amount held.
-
 use crate::{
 	slot_range::SlotRange,
 	traits::{Auctioneer, Registrar},
@@ -70,7 +68,7 @@ use frame_support::{
 };
 pub use pallet::*;
 use parity_scale_codec::{Decode, Encode};
-use primitives::v2::Id as ParaId;
+use primitives::Id as ParaId;
 use scale_info::TypeInfo;
 use sp_runtime::{
 	traits::{
@@ -188,7 +186,6 @@ pub mod pallet {
 	const STORAGE_VERSION: StorageVersion = StorageVersion::new(1);
 
 	#[pallet::pallet]
-	#[pallet::generate_store(pub(super) trait Store)]
 	#[pallet::without_storage_info]
 	#[pallet::storage_version(STORAGE_VERSION)]
 	pub struct Pallet<T>(_);
@@ -372,6 +369,7 @@ pub mod pallet {
 		///
 		/// This applies a lock to your parachain configuration, ensuring that it cannot be changed
 		/// by the parachain manager.
+		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::create())]
 		pub fn create(
 			origin: OriginFor<T>,
@@ -421,6 +419,7 @@ pub mod pallet {
 
 			let deposit = T::SubmissionDeposit::get();
 
+			frame_system::Pallet::<T>::inc_providers(&Self::fund_account_id(fund_index));
 			CurrencyOf::<T>::reserve(&depositor, deposit)?;
 
 			Funds::<T>::insert(
@@ -449,6 +448,7 @@ pub mod pallet {
 
 		/// Contribute to a crowd sale. This will transfer some balance over to fund a parachain
 		/// slot. It will be withdrawable when the crowdloan has ended and the funds are unused.
+		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::contribute())]
 		pub fn contribute(
 			origin: OriginFor<T>,
@@ -477,6 +477,7 @@ pub mod pallet {
 		///
 		/// - `who`: The account whose contribution should be withdrawn.
 		/// - `index`: The parachain to whose crowdloan the contribution was made.
+		#[pallet::call_index(2)]
 		#[pallet::weight(T::WeightInfo::withdraw())]
 		pub fn withdraw(
 			origin: OriginFor<T>,
@@ -510,6 +511,7 @@ pub mod pallet {
 		/// times to fully refund all users. We will refund `RemoveKeysLimit` users at a time.
 		///
 		/// Origin must be signed, but can come from anyone.
+		#[pallet::call_index(3)]
 		#[pallet::weight(T::WeightInfo::refund(T::RemoveKeysLimit::get()))]
 		pub fn refund(
 			origin: OriginFor<T>,
@@ -555,6 +557,7 @@ pub mod pallet {
 		}
 
 		/// Remove a fund after the retirement period has ended and all funds have been returned.
+		#[pallet::call_index(4)]
 		#[pallet::weight(T::WeightInfo::dissolve())]
 		pub fn dissolve(origin: OriginFor<T>, #[pallet::compact] index: ParaId) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -573,6 +576,7 @@ pub mod pallet {
 			// can take care of that.
 			debug_assert!(Self::contribution_iterator(fund.fund_index).count().is_zero());
 
+			frame_system::Pallet::<T>::dec_providers(&Self::fund_account_id(fund.fund_index))?;
 			CurrencyOf::<T>::unreserve(&fund.depositor, fund.deposit);
 			Funds::<T>::remove(index);
 			Self::deposit_event(Event::<T>::Dissolved { para_id: index });
@@ -582,6 +586,7 @@ pub mod pallet {
 		/// Edit the configuration for an in-progress crowdloan.
 		///
 		/// Can only be called by Root origin.
+		#[pallet::call_index(5)]
 		#[pallet::weight(T::WeightInfo::edit())]
 		pub fn edit(
 			origin: OriginFor<T>,
@@ -619,6 +624,7 @@ pub mod pallet {
 		/// Add an optional memo to an existing crowdloan contribution.
 		///
 		/// Origin must be Signed, and the user must have contributed to the crowdloan.
+		#[pallet::call_index(6)]
 		#[pallet::weight(T::WeightInfo::add_memo())]
 		pub fn add_memo(origin: OriginFor<T>, index: ParaId, memo: Vec<u8>) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -637,6 +643,7 @@ pub mod pallet {
 		/// Poke the fund into `NewRaise`
 		///
 		/// Origin must be Signed, and the fund has non-zero raise.
+		#[pallet::call_index(7)]
 		#[pallet::weight(T::WeightInfo::poke())]
 		pub fn poke(origin: OriginFor<T>, index: ParaId) -> DispatchResult {
 			ensure_signed(origin)?;
@@ -650,6 +657,7 @@ pub mod pallet {
 
 		/// Contribute your entire balance to a crowd sale. This will transfer the entire balance of a user over to fund a parachain
 		/// slot. It will be withdrawable when the crowdloan has ended and the funds are unused.
+		#[pallet::call_index(8)]
 		#[pallet::weight(T::WeightInfo::contribute())]
 		pub fn contribute_all(
 			origin: OriginFor<T>,
@@ -855,9 +863,9 @@ mod tests {
 
 	use frame_support::{
 		assert_noop, assert_ok, parameter_types,
-		traits::{OnFinalize, OnInitialize},
+		traits::{ConstU32, OnFinalize, OnInitialize},
 	};
-	use primitives::v2::Id as ParaId;
+	use primitives::Id as ParaId;
 	use sp_core::H256;
 	use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 	// The testing primitives are very useful for avoiding having to work with signatures
@@ -868,7 +876,7 @@ mod tests {
 		traits::{AuctionStatus, OnSwap},
 	};
 	use ::test_helpers::{dummy_head_data, dummy_validation_code};
-	use sp_keystore::{testing::KeyStore, KeystoreExt};
+	use sp_keystore::{testing::MemoryKeystore, KeystoreExt};
 	use sp_runtime::{
 		testing::Header,
 		traits::{BlakeTwo256, IdentityLookup, TrailingZeroInput},
@@ -937,6 +945,10 @@ mod tests {
 		type MaxReserves = ();
 		type ReserveIdentifier = [u8; 8];
 		type WeightInfo = ();
+		type HoldIdentifier = ();
+		type FreezeIdentifier = ();
+		type MaxHolds = ConstU32<1>;
+		type MaxFreezes = ConstU32<1>;
 	}
 
 	#[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -981,9 +993,10 @@ mod tests {
 		let fund = Funds::<Test>::get(para).unwrap();
 		let account_id = Crowdloan::fund_account_id(fund.fund_index);
 		if winner {
+			let ed = <Test as pallet_balances::Config>::ExistentialDeposit::get();
 			let free_balance = Balances::free_balance(&account_id);
-			Balances::reserve(&account_id, free_balance)
-				.expect("should be able to reserve free balance");
+			Balances::reserve(&account_id, free_balance - ed)
+				.expect("should be able to reserve free balance minus ED");
 		} else {
 			let reserved_balance = Balances::reserved_balance(&account_id);
 			Balances::unreserve(&account_id, reserved_balance);
@@ -1103,7 +1116,7 @@ mod tests {
 		}
 		.assimilate_storage(&mut t)
 		.unwrap();
-		let keystore = KeyStore::new();
+		let keystore = MemoryKeystore::new();
 		let mut t: sp_io::TestExternalities = t.into();
 		t.register_extension(KeystoreExt(Arc::new(keystore)));
 		t
@@ -1607,7 +1620,7 @@ mod tests {
 			let account_id = Crowdloan::fund_account_id(index);
 
 			// user sends the crowdloan funds trying to make an accounting error
-			assert_ok!(Balances::transfer(RuntimeOrigin::signed(1), account_id, 10));
+			assert_ok!(Balances::transfer_allow_death(RuntimeOrigin::signed(1), account_id, 10));
 
 			// overfunded now
 			assert_eq!(Balances::free_balance(&account_id), 110);
@@ -1776,6 +1789,7 @@ mod tests {
 	#[test]
 	fn withdraw_from_finished_works() {
 		new_test_ext().execute_with(|| {
+			assert_eq!(<Test as pallet_balances::Config>::ExistentialDeposit::get(), 1);
 			let para = new_para();
 			let index = NextFundIndex::<Test>::get();
 			let account_id = Crowdloan::fund_account_id(index);
@@ -1787,7 +1801,7 @@ mod tests {
 			assert_ok!(Crowdloan::contribute(RuntimeOrigin::signed(2), para, 100, None));
 			assert_ok!(Crowdloan::contribute(RuntimeOrigin::signed(3), para, 50, None));
 			// simulate the reserving of para's funds. this actually happens in the Slots pallet.
-			assert_ok!(Balances::reserve(&account_id, 150));
+			assert_ok!(Balances::reserve(&account_id, 149));
 
 			run_to_block(19);
 			assert_noop!(

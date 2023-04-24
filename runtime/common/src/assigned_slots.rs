@@ -1,4 +1,4 @@
-// Copyright 2021 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -32,7 +32,7 @@ use frame_support::{pallet_prelude::*, traits::Currency};
 use frame_system::pallet_prelude::*;
 pub use pallet::*;
 use parity_scale_codec::{Decode, Encode, MaxEncodedLen};
-use primitives::v2::Id as ParaId;
+use primitives::Id as ParaId;
 use runtime_parachains::{
 	configuration,
 	paras::{self},
@@ -78,7 +78,6 @@ pub mod pallet {
 	use super::*;
 
 	#[pallet::pallet]
-	#[pallet::generate_store(pub(super) trait Store)]
 	pub struct Pallet<T>(_);
 
 	#[pallet::config]
@@ -200,6 +199,7 @@ pub mod pallet {
 	impl<T: Config> Pallet<T> {
 		// TODO: Benchmark this
 		/// Assign a permanent parachain slot and immediately create a lease for it.
+		#[pallet::call_index(0)]
 		#[pallet::weight(((MAXIMUM_BLOCK_WEIGHT / 10) as Weight, DispatchClass::Operational))]
 		pub fn assign_perm_parachain_slot(origin: OriginFor<T>, id: ParaId) -> DispatchResult {
 			T::AssignSlotOrigin::ensure_origin(origin)?;
@@ -258,6 +258,7 @@ pub mod pallet {
 		/// Assign a temporary parachain slot. The function tries to create a lease for it
 		/// immediately if `SlotLeasePeriodStart::Current` is specified, and if the number
 		/// of currently active temporary slots is below `MaxTemporarySlotPerLeasePeriod`.
+		#[pallet::call_index(1)]
 		#[pallet::weight(((MAXIMUM_BLOCK_WEIGHT / 10) as Weight, DispatchClass::Operational))]
 		pub fn assign_temp_parachain_slot(
 			origin: OriginFor<T>,
@@ -341,6 +342,7 @@ pub mod pallet {
 
 		// TODO: Benchmark this
 		/// Unassign a permanent or temporary parachain slot
+		#[pallet::call_index(2)]
 		#[pallet::weight(((MAXIMUM_BLOCK_WEIGHT / 10) as Weight, DispatchClass::Operational))]
 		pub fn unassign_parachain_slot(origin: OriginFor<T>, id: ParaId) -> DispatchResult {
 			T::AssignSlotOrigin::ensure_origin(origin.clone())?;
@@ -546,7 +548,7 @@ mod tests {
 	use frame_support::{assert_noop, assert_ok, parameter_types};
 	use frame_system::EnsureRoot;
 	use pallet_balances;
-	use primitives::v2::{BlockNumber, Header};
+	use primitives::{BlockNumber, Header};
 	use runtime_parachains::{
 		configuration as parachains_configuration, paras as parachains_paras,
 		shared as parachains_shared,
@@ -629,6 +631,10 @@ mod tests {
 		type MaxLocks = ();
 		type MaxReserves = ();
 		type ReserveIdentifier = [u8; 8];
+		type HoldIdentifier = ();
+		type FreezeIdentifier = ();
+		type MaxHolds = ConstU32<1>;
+		type MaxFreezes = ConstU32<1>;
 	}
 
 	impl parachains_configuration::Config for Test {
